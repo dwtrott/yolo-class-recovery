@@ -101,7 +101,9 @@ class OpenAIUncondPrior(DiffusionPrior):
 
     def _unet(self, z: torch.Tensor, t, emb: Optional[torch.Tensor]) -> torch.Tensor:
         tt = torch.as_tensor(t, device=self.device).reshape(-1).expand(z.shape[0])
-        out = self._model(z.to(self.dtype), tt.long())
+        # input stays fp32: the network casts its body to fp16 internally and casts back to the
+        # input dtype before the (fp32) output conv, exactly as the original sampling code does
+        out = self._model(z.float(), tt.long())
         return out[:, :3].float()               # first 3 channels = eps; the rest is the learned variance
 
 
