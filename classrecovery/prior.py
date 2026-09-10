@@ -78,12 +78,11 @@ def to_tensor01(images: Sequence[Image.Image], size: int, device) -> torch.Tenso
 @dataclass
 class GuidanceConfig:
     steps: int = 50            # denoising steps for a from-noise run
-    strength: float = 0.1      # guidance step as a fraction of ||z_t|| (per gradient step)
+    strength: float = 0.03     # guidance step as a fraction of ||z_t|| (per gradient step); keep small
     repeats: int = 1           # gradient steps per denoising step
-    guide_from: float = 1.0    # guide while guide_to <= t/T <= guide_from
-    guide_to: float = 0.15
-    smooth_k: int = 4          # SmoothGrad: average the objective over k noisy copies (1 = off)
-    smooth_sigma: float = 0.08 # std of that noise in [0,1] image units
+    guide_frac: float = 0.5    # guide during the first fraction of THIS run's steps (rest: prior finishes cleanly)
+    smooth_k: int = 8          # SmoothGrad: average the objective over k noisy copies (1 = off)
+    smooth_sigma: float = 0.15 # std of that noise in [0,1] image units
     n_images: int = 4
     seed: Optional[int] = None
     refine_noise: float = 0.5  # guided_refine: fraction of the noise schedule to re-noise the seed to
@@ -142,8 +141,7 @@ class UncondPrior:
         for i, t in enumerate(ts):
             a_t = acp[t]
             a_prev = acp[ts[i + 1]] if i + 1 < len(ts) else torch.tensor(1.0, device=self.device)
-            frac = float(t) / T
-            guide = objective is not None and cfg.strength > 0 and cfg.guide_to <= frac <= cfg.guide_from
+            guide = objective is not None and cfg.strength > 0 and i < max(1, int(round(cfg.guide_frac * len(ts))))
             if guide:
                 zg = z.detach()
                 for _ in range(max(1, cfg.repeats)):
@@ -195,3 +193,25 @@ class UncondPrior:
         noise = torch.randn(x.shape, generator=gen, device=self.device)
         z = a_t.sqrt() * x + (1 - a_t).sqrt() * noise
         return self._sample(z, ts, objective, cfg, gen, on_step)
+
+
+    # ------------------------------------------------------------- realness
+    @torch.no_grad()
+    def realness(self, images: Sequence[Image.Image], level: float = 0.3, n: int = 2, seed: int = 0) -> torch.Tensor:
+        """Label-free "is this on the natural-image manifold" score from the prior itself.
+
+        Noise each image to ``level`` of the schedule, ask the model for its clean estimate,
+        and return the reconstruction MSE (lower = more natural).  Adversarial textures sit
+        off-manifold and reconstruct badly; ordinary photos reconstruct well.
+        """
+        gen = torch.Generator(self.device).manual_seed(seed)
+        x = to_tensor01(images, self.image_size, self.device) * 2 - 1
+        t = int(self.ddim.config.num_train_timesteps * level)
+        a_t = self.ddim.alphas_cumprod.to(self.device)[t]
+        errs = []
+        for _ in range(n):
+            noise = torch.randn(x.shape, generator=gen, device=self.device)
+            z = a_t.sqrt() * x + (1 - a_t).sqrt() * noise
+            x0, _ = self._x0_eps(z, t, a_t)
+            errs.append(((x0.clamp(-1, 1) - x) ** 2).mean((1, 2, 3)))
+        return torch.stack(errs).mean(0).cpu()

@@ -22,10 +22,16 @@ code("""#@title 1. Install  (≈2 min)
 %pip install -q ./yolo-class-recovery
 import classrecovery; print("classrecovery", classrecovery.__version__)""")
 
-code("""#@title 2. A mystery model to test on  (fine-tune YOLOv8n on 4 non-COCO classes, strip the names; ≈3 min)
-#@markdown Skip this if you have your own checkpoint — upload it and use its path below.
+code("""#@title 2. A mystery model to test on  (fine-tune YOLOv8n, strip the names; ≈3–10 min)
+#@markdown `african-wildlife` is the easy case (ImageNet can draw all four, COCO val contains two of them).
+#@markdown Harder, fairer tests — classes the prior cannot draw and the pool does not contain:
+#@markdown `signature.yaml` (handwritten signatures), `medical-pills.yaml`, `brain-tumor.yaml`,
+#@markdown `dota8.yaml` / `VisDrone.yaml` (aerial: storage tank, roundabout, ship, small vehicle ...).
+#@markdown Skip this cell if you have your own checkpoint — upload it and use its path below.
+DATASET = "african-wildlife.yaml"  #@param ["african-wildlife.yaml", "signature.yaml", "medical-pills.yaml", "brain-tumor.yaml", "dota8.yaml", "VisDrone.yaml"]
+EPOCHS = 15  #@param {type:"integer"}
 from classrecovery.testbed import build_testbed
-build_testbed("testbed", dataset="african-wildlife.yaml", base="yolov8n.pt", epochs=15, imgsz=640)""")
+build_testbed("testbed", dataset=DATASET, base="yolov8n.pt", epochs=EPOCHS, imgsz=640)""")
 
 code("""#@title 3. An unlabeled photo pool  (COCO val2017, 5 000 images, ≈1 GB; ≈1 min)
 #@markdown Any folder of images works. No labels are read — the pool is just photographs.
@@ -35,15 +41,18 @@ print(POOL)""")
 
 code("""#@title 4. Recover one class first  (≈5 min; first run also downloads the 2 GB diffusion prior)
 from classrecovery import represent
-results = represent("testbed/mystery.pt", pool=POOL, classes=[3], n_seeds=6, n_noise=4,
-                    steps=50, strength=0.1, smooth_k=4, out_dir="runs/v1")
-#@markdown The sheet shows the best images first; each is labelled seed / refined / noise with the detector
-#@markdown score and the robustness score.""")
+results = represent("testbed/mystery.pt", pool=POOL, classes=[0], n_seeds=6, n_noise=4, out_dir="runs/v1")
+#@markdown Best images first, each labelled seed / refined / noise with: `det` (raw detector score),
+#@markdown `degraded` (mean score under noise / blur / JPEG / half-res — adversarial patterns collapse here),
+#@markdown `err` (the prior's reconstruction error — off-manifold images score high and are flagged).""")
 
 code("""#@title 5. All classes
-results = represent("testbed/mystery.pt", pool=POOL, n_seeds=6, n_noise=4, steps=50, strength=0.1, out_dir="runs/v1")""")
+results = represent("testbed/mystery.pt", pool=POOL, n_seeds=6, n_noise=4, out_dir="runs/v1")""")
 
-code("""#@title 6. (optional) Prototype pass — cluster the candidates' internal activations and re-guide toward the dominant mode
+code("""#@title 6. Ablation: no pool — does the from-noise path stand on its own?
+results_noise = represent("testbed/mystery.pt", pool=None, classes=[0], n_noise=6, out_dir="runs/v1_noise")""")
+
+code("""#@title 6b. (optional) Prototype pass — cluster the candidates' internal activations and re-guide toward the dominant mode
 results = represent("testbed/mystery.pt", pool=POOL, classes=[3], use_prototype=True, out_dir="runs/v1_proto")""")
 
 code("""#@title 7. (afterwards) The testbed's real names

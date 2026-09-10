@@ -30,15 +30,15 @@ from PIL import Image
 
 from .detector import ClassObjective, Detector
 from .prior import GuidanceConfig, UncondPrior
-from .robust import RobustObjective, discover_prototype
+from .robust import RobustObjective, degradation_scores, discover_prototype
 from .seeds import list_images, mine_seeds
 from .viz import ClassResult, class_sheet
 
 
 def represent(weights: str, pool: Optional[str] = None, classes: Optional[Sequence[int]] = None,
               prior: Optional[UncondPrior] = None, n_seeds: int = 6, n_noise: int = 4, pool_limit: Optional[int] = None,
-              steps: int = 50, strength: float = 0.1, refine_noise: float = 0.5, smooth_k: int = 4,
-              repeats: int = 1, guide_to: float = 0.15, seed: int = 0, use_prototype: bool = False,
+              steps: int = 50, strength: float = 0.03, refine_noise: float = 0.5, smooth_k: int = 8,
+              repeats: int = 1, guide_frac: float = 0.5, seed: int = 0, use_prototype: bool = False,
               min_seed_score: float = 0.15, det_imgsz: int = 320, out_dir: Optional[str] = None, show: bool = True,
               progress: Optional[Callable[[str], None]] = print) -> Dict[int, ClassResult]:
     """See module docstring.  Returns ``{class_idx: ClassResult}``.
@@ -63,7 +63,7 @@ def represent(weights: str, pool: Optional[str] = None, classes: Optional[Sequen
     for c in classes:
         rec = ClassResult(c)
         guide = ClassObjective(det, c, n_aug=2, seed=seed)
-        cfg = GuidanceConfig(steps=steps, strength=strength, repeats=repeats, guide_to=guide_to,
+        cfg = GuidanceConfig(steps=steps, strength=strength, repeats=repeats, guide_frac=guide_frac,
                              smooth_k=smooth_k, seed=seed, refine_noise=refine_noise)
         cand: List[Image.Image] = []
         src: List[str] = []
@@ -116,19 +116,26 @@ def represent(weights: str, pool: Optional[str] = None, classes: Optional[Sequen
             cand += out["images"]
             src += ["prototype"] * len(out["images"])
 
-        # 4. rank
-        ro = RobustObjective(det, c, seed=seed)
-        T = ro.evaluate(cand)
-        det_scores = det.class_scores(cand)[:, c].tolist()
-        order = sorted(range(len(cand)), key=lambda i: -float(T["total"][i]))
+        # 4. rank: adversarial patterns die under mild degradation and sit off the prior's manifold;
+        #    real objects survive both.  Rank by the mean score under degradation, drop candidates
+        #    the prior itself cannot reconstruct, and use the raw score only as a tie-breaker.
+        D = degradation_scores(det, c, cand, seed=seed)
+        real = prior.realness(cand, seed=seed)
+        med = float(real.median())
+        on_manifold = [float(real[i]) <= 2.0 * med + 1e-6 for i in range(len(cand))]
+        det_scores = D["clean"].tolist()
+        key = [float(D["mean"][i]) + 0.05 * det_scores[i] - (0.0 if on_manifold[i] else 10.0) for i in range(len(cand))]
+        order = sorted(range(len(cand)), key=lambda i: -key[i])
         rec.images = [cand[i] for i in order]
         rec.scores = [det_scores[i] for i in order]
-        rec.robust = [float(T["total"][i]) for i in order]
-        rec.source = [src[i] for i in order]
+        rec.robust = [float(D["mean"][i]) for i in order]             # mean score under noise/blur/jpeg/half-res
+        rec.realness = [float(real[i]) for i in order]
+        rec.source = [src[i] + ("" if on_manifold[i] else "*off-manifold") for i in order]
         rec.note = f"{len(seeds)} seeds, {src.count('refined')} refined, {src.count('noise')} from noise"
         results[c] = rec
 
-        sheet = class_sheet(rec, title=f"class {c}   best: {rec.source[0]}  det={rec.scores[0]:.2f}  robust={rec.robust[0]:+.2f}")
+        sheet = class_sheet(rec, title=f"class {c}   best: {rec.source[0]}  det={rec.scores[0]:.2f}  "
+                                       f"survives-degradation={rec.robust[0]:.2f}  recon-err={rec.realness[0]:.3f}")
         if out_dir:
             d = os.path.join(out_dir, f"class_{c:03d}")
             os.makedirs(d, exist_ok=True)

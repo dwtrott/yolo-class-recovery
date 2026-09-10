@@ -15,7 +15,8 @@ class ClassResult:
     class_idx: int
     images: List[Image.Image] = field(default_factory=list)      # best first
     scores: List[float] = field(default_factory=list)            # detector class score per image
-    robust: List[float] = field(default_factory=list)            # robust composite per image
+    robust: List[float] = field(default_factory=list)            # min class score under degradations
+    realness: List[float] = field(default_factory=list)          # prior reconstruction error (lower = more natural)
     source: List[str] = field(default_factory=list)              # "refined", "seed", "noise"
     modes: List[Tuple[int, float]] = field(default_factory=list) # (n members, robust) per discovered mode
     trace: List[List[float]] = field(default_factory=list)
@@ -33,8 +34,9 @@ def _font(size: int):
 
 def class_sheet(rec: ClassResult, thumb: int = 256, max_images: int = 8, title: Optional[str] = None) -> Image.Image:
     """Header + one row of images for one class (best first), each captioned with source and scores."""
-    tiles = [(im, f"{src}  det={sc:.2f}  robust={rb:+.2f}") for im, sc, rb, src in
-             zip(rec.images, rec.scores, rec.robust, rec.source)][:max_images]
+    rl = rec.realness or [float("nan")] * len(rec.images)
+    tiles = [(im, f"{src}  det={sc:.2f}  degraded={rb:.2f}  err={r:.3f}") for im, sc, rb, r, src in
+             zip(rec.images, rec.scores, rec.robust, rl, rec.source)][:max_images]
     tiles = tiles or [(Image.new("RGB", (thumb, thumb), (40, 40, 40)), "no images")]
     head_h, cap_h, pad = 64, 22, 6
     W = len(tiles) * (thumb + pad) + pad

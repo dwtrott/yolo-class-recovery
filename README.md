@@ -30,8 +30,10 @@ The class count is read from the head architecture (`4 + nc` output channels). T
 3. **Noise.** If the pool yielded nothing (a class it does not cover), sample from pure noise under
    the same guidance — classifier guidance in the original Dhariwal & Nichol sense, with the
    detector as the classifier.
-4. **Rank.** Score every candidate with a robustness composite and show the best first, labelled by
-   where it came from (`seed` / `refined` / `noise`).
+4. **Rank.** Adversarial patterns die under mild degradation and sit off the prior's manifold; real
+   objects survive both. Every candidate is scored under noise / blur / JPEG / half-resolution and
+   ranked by the *mean* of those; candidates the prior cannot reconstruct are flagged `*off-manifold`;
+   the raw detector score is only a tie-breaker. Best first, labelled `seed` / `refined` / `noise`.
 
 **Guidance** pushes the gradient of the class objective back *through the diffusion network* into
 the noisy image at each step, and averages that gradient over noisy copies of the decoded image
@@ -73,7 +75,7 @@ classrecovery/
 * `strength` (0.05–0.2): detector vs prior. Score flat and images generic → raise; images texture-y → lower.
 * `smooth_k` (1–8): gradient smoothing; 4 is a good default, 8 if speckle persists.
 * `refine_noise` (0.3–0.7): how much of the seed to keep; lower keeps more of the photo.
-* `guide_to` (0.15–0.5): stop guiding earlier to let the prior finish cleanly.
+* `guide_frac` (0.3–0.8): fraction of each run that is guided; the rest lets the prior finish cleanly.
 * `use_prototype`: cluster candidates' internal activations and re-guide toward the dominant mode.
 
 ## Caveats

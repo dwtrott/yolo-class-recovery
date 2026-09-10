@@ -287,3 +287,63 @@ def discover_prototype(detector: Detector, prior: UncondPrior, class_idx: int, n
         modes.append(Mode(idx, float(rs[idx].mean()), [imgs[i] for i in idx], proto))
     modes.sort(key=lambda m: -m.robust)
     return {"modes": modes, "candidates": imgs, "scores": T, "dominant": modes[0]}
+
+
+# --------------------------------------------------------------------- degradation-robust score
+def _jpeg(img01: torch.Tensor, quality: int = 40) -> torch.Tensor:
+    import io
+    from PIL import Image as _I
+    out = []
+    for x in img01:
+        buf = io.BytesIO()
+        _I.fromarray((x.clamp(0, 1) * 255).byte().permute(1, 2, 0).cpu().numpy()).save(buf, "JPEG", quality=quality)
+        buf.seek(0)
+        import numpy as np
+        y = torch.from_numpy(np.array(_I.open(buf).convert("RGB"), copy=True)).permute(2, 0, 1).float() / 255
+        out.append(y.to(img01.device))
+    return torch.stack(out)
+
+
+def _blur(img01: torch.Tensor, sigma: float = 2.0) -> torch.Tensor:
+    k = int(2 * round(3 * sigma) + 1)
+    ax = torch.arange(k, device=img01.device).float() - (k - 1) / 2
+    g = torch.exp(-ax ** 2 / (2 * sigma ** 2)); g = g / g.sum()
+    w = (g[:, None] * g[None, :])[None, None].expand(3, 1, k, k)
+    return F.conv2d(F.pad(img01, (k // 2,) * 4, mode="reflect"), w, groups=3)
+
+
+DEGRADATIONS = {
+    "noise0.02": lambda x, g: (x + 0.02 * torch.randn(x.shape, generator=g, device=x.device)).clamp(0, 1),
+    "noise0.04": lambda x, g: (x + 0.04 * torch.randn(x.shape, generator=g, device=x.device)).clamp(0, 1),
+    "blur1.5": lambda x, g: _blur(x, 1.5),
+    "jpeg50": lambda x, g: _jpeg(x, 50),
+    "half-res": lambda x, g: F.interpolate(F.interpolate(x, scale_factor=0.5, mode="bilinear", align_corners=False),
+                                            size=x.shape[-2:], mode="bilinear", align_corners=False),
+}
+
+
+@torch.no_grad()
+def degradation_scores(detector: Detector, class_idx: int, images: Sequence[Image.Image], seed: int = 0,
+                       min_area: float = 0.03, max_area: float = 0.8) -> Dict[str, torch.Tensor]:
+    """Detector class score for each image under each degradation, plus ``min`` across them.
+
+    Adversarial patterns collapse under mild noise / blur / JPEG; real objects do not.
+    Ranking by the minimum is the simplest label-free defence against "det=1.00 speckle".
+    """
+    from .detector import _to_tensor01
+    g = torch.Generator(device=detector.device).manual_seed(seed)
+    sz = (detector.imgsz,) * 2
+    x = torch.stack([F.interpolate(_to_tensor01(im)[None], size=sz, mode="bilinear", align_corners=False)[0]
+                     for im in images]).to(detector.device)
+    obj = ClassObjective(detector, class_idx, min_area=min_area, max_area=max_area, margin=0.0, n_aug=0)
+
+    def score(xx):
+        p_k, _, _ = obj.anchor_scores(xx)
+        return p_k.amax(-1).clamp(min=0).cpu()
+
+    out = {"clean": score(x)}
+    for name, fn in DEGRADATIONS.items():
+        out[name] = score(fn(x, g))
+    out["min"] = torch.stack([out[k] for k in DEGRADATIONS]).amin(0)
+    out["mean"] = torch.stack([out[k] for k in DEGRADATIONS]).mean(0)
+    return out
