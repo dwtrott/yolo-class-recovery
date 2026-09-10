@@ -54,8 +54,9 @@ def _square_crop(im: Image.Image, box01: Sequence[float], pad: float = 0.35, siz
     x0, y0, x1, y1 = box01
     cx, cy = (x0 + x1) / 2 * W, (y0 + y1) / 2 * H
     side = max((x1 - x0) * W, (y1 - y0) * H) * (1 + 2 * pad)
-    side = max(side, 32)
-    l, t = cx - side / 2, cy - side / 2
+    side = min(max(side, 32), min(W, H))                     # never larger than the image
+    l = min(max(cx - side / 2, 0), W - side)                 # shift the window inside the image
+    t = min(max(cy - side / 2, 0), H - side)                 # (no black borders)
     return im.crop((int(l), int(t), int(l + side), int(t + side))).resize((size, size))
 
 

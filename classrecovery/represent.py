@@ -39,7 +39,7 @@ def represent(weights: str, pool: Optional[str] = None, classes: Optional[Sequen
               prior: Optional[UncondPrior] = None, n_seeds: int = 6, n_noise: int = 4, pool_limit: Optional[int] = None,
               steps: int = 50, strength: float = 0.03, refine_noise: float = 0.5, smooth_k: int = 8,
               repeats: int = 1, guide_frac: float = 0.5, seed: int = 0, use_prototype: bool = False,
-              min_seed_score: float = 0.15, det_imgsz: int = 320, bn_weight: float = 0.3,
+              min_seed_score: float = 0.15, det_imgsz: int = 320, bn_weight: float = 0.0,
               out_dir: Optional[str] = None, show: bool = True,
               progress: Optional[Callable[[str], None]] = print) -> Dict[int, ClassResult]:
     """See module docstring.  Returns ``{class_idx: ClassResult}``.
@@ -50,9 +50,9 @@ def represent(weights: str, pool: Optional[str] = None, classes: Optional[Sequen
                     otherwise only if ``n_noise`` > 0 and you want the comparison)
     use_prototype   also cluster the candidates' internal activations and re-guide toward the
                     dominant mode (slower; helps when the candidates are mixed)
-    bn_weight       weight of the BatchNorm-statistics term (DeepInversion): pulls generations toward
-                    the detector's own training distribution — the only prior available for a class
-                    the diffusion model has never seen.  0 disables it.
+    bn_weight       BatchNorm-statistics term (DeepInversion).  OFF by default: at 0.3-0.6 it pulls
+                    images toward flat posterised colour and collapses from-noise samples; if you
+                    experiment, start at 0.02.
     """
     det = Detector(weights, imgsz=det_imgsz)      # 320 suits the 256px prior; raise for a high-res detector
     if progress:
