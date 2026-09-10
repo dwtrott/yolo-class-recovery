@@ -1,12 +1,24 @@
-"""The one-call interface: detector checkpoint in, representative images per class out.
+"""Checkpoint in, clear high-scoring images per class out.
 
-    from classrecovery.represent import represent
-    sheets = represent("mystery.pt")            # list of PIL images, one per class
+    from classrecovery import represent
+    results = represent("mystery.pt", pool="pools/coco-val2017")
 
-Nothing about the classes is assumed.  The class count is read from the
-architecture, and for every class index the diffusion model is steered by the
-detector's own gradient from a neutral prompt until the detector fires on what
-it paints.  No vocabulary, no CLIP, no ground truth — just weights + prior.
+For every class index (read from the head architecture — nothing else is
+assumed about the model):
+
+1. **seed**    scan an unlabeled image pool with the detector; keep the crops the
+               class fires on and that pass the robust checks (real photos, so
+               they are clear by construction)
+2. **refine**  SDEdit: re-noise each seed to ~50 % and denoise under detector
+               guidance (smoothed gradient, through the diffusion network) so the
+               prior sharpens the object into what the class most wants to see
+3. **noise**   if the pool gave nothing (a class the pool does not cover), sample
+               from pure noise under the same guidance
+4. **rank**    score everything with the robust composite (augmentation
+               consistency, box stability, localization, cutout survival); the
+               contact sheet shows the best first, labelled by where it came from
+
+No class names, captions, vocabularies, or labels are used anywhere.
 """
 
 from __future__ import annotations
@@ -17,130 +29,111 @@ from typing import Callable, Dict, List, Optional, Sequence
 from PIL import Image
 
 from .detector import ClassObjective, Detector
-from .diffusion import DiffusionPrior, GuidanceConfig
-from .pipeline import ClassRecovery
-from .viz import class_sheet
+from .prior import GuidanceConfig, UncondPrior
+from .robust import RobustObjective, discover_prototype
+from .seeds import list_images, mine_seeds
+from .viz import ClassResult, class_sheet
 
 
-def represent(weights: str, classes: Optional[Sequence[int]] = None, prior: Optional[DiffusionPrior] = None,
-              prior_id: str = "openai/imagenet-256-uncond", unconditional: bool = False,
-              mode: str = "classifier", prompt: str = "",
-              n_images: int = 4, iters: int = 150, lr: float = 0.02, batch: int = 4, gen_steps: int = 1,
-              reg: float = 0.05, steps: int = 50, cfg: float = 0.0, strength: float = 0.1, repeats: int = 1,
-              guide_to: float = 0.15, res: int = 512, seed: int = 0, margin: float = 0.5, n_aug: int = 2,
-              hint_words: bool = False, n_candidates: int = 24, out_dir: Optional[str] = None, show: bool = True,
-              progress: Optional[Callable[[str], None]] = print) -> Dict[int, ClassRecovery]:
-    """Produce representative images for every class of ``weights``.
+def represent(weights: str, pool: Optional[str] = None, classes: Optional[Sequence[int]] = None,
+              prior: Optional[UncondPrior] = None, n_seeds: int = 6, n_noise: int = 4, pool_limit: Optional[int] = None,
+              steps: int = 50, strength: float = 0.1, refine_noise: float = 0.5, smooth_k: int = 4,
+              repeats: int = 1, guide_to: float = 0.15, seed: int = 0, use_prototype: bool = False,
+              min_seed_score: float = 0.15, det_imgsz: int = 320, out_dir: Optional[str] = None, show: bool = True,
+              progress: Optional[Callable[[str], None]] = print) -> Dict[int, ClassResult]:
+    """See module docstring.  Returns ``{class_idx: ClassResult}``.
 
-    mode="classifier" (default): classifier guidance in the original sense.
-        The diffusion model runs *unconditionally* and at every denoising
-        step the gradient of the detector's class-k score is pushed back
-        through the diffusion network into the noisy image.  Default prior
-        is OpenAI's unconditional 256px ImageNet model (``openai/...``, never
-        saw a caption); any Stable-Diffusion id uses SD's no-text branch and
-        ``unconditional=True`` loads a text-free diffusers checkpoint.
-        At every denoising step the gradient of the
-        detector's class-k score is pushed back through the diffusion network
-        into the noisy state.  The only thing that decides the content is the
-        detector's activations.  ~50 steps, gradient through the UNet each
-        step: a few minutes per class on an A100.
-    mode="robust": two-phase.  (1) generate ``n_candidates`` under plain
-        classifier guidance, score each with the composite robust objective
-        (class + augmentation consistency + box stability + localization +
-        cutout survival), cluster the detector's own multi-layer ROI
-        activations of the best candidates, take the dominant cluster as a
-        pseudo-prototype.  (2) regenerate under the full objective pulled
-        toward that prototype.  Finds "a stable concept that repeatedly
-        explains class k" rather than "anything that excites class k".
-    mode="embedding": textual inversion against the detector — the
-        text embedding fed to the diffusion model is optimised (``iters`` Adam
-        steps, ``batch`` fresh noises each) until the detector fires on what it
-        paints, then ``n_images`` fresh samples are rendered from it.  This
-        changes *what* is painted, which is what you want.  Needs backprop
-        through the generator: fine on an A100 at 512px with sd-turbo.
-    mode="latent": the cheaper latent-guidance sampler (steers texture/layout
-        only; kept for comparison).
-
-    Returns ``{class_idx: ClassRecovery}``; each has ``guided_images`` (PIL),
-    ``guided_scores`` (detector score on each) and ``guided_trace``.  With
-    ``show=True`` a contact sheet per class is displayed inline (notebooks);
-    with ``out_dir`` the images and sheets are also written to disk.
-    ``hint_words`` adds, as a label-free hint, which vocabulary prompts the
-    optimised embedding ended up closest to.
+    pool            directory of unlabeled images (see ``seeds.download_pool``); None = noise only
+    n_seeds         seeds to mine and refine per class
+    n_noise         from-noise samples per class (always generated when the pool yields < 2 seeds,
+                    otherwise only if ``n_noise`` > 0 and you want the comparison)
+    use_prototype   also cluster the candidates' internal activations and re-guide toward the
+                    dominant mode (slower; helps when the candidates are mixed)
     """
-    det = Detector(weights)
+    det = Detector(weights, imgsz=det_imgsz)      # 320 suits the 256px prior; raise for a high-res detector
     if progress:
         progress(f"loaded {weights}: {det.nc} classes read from the head architecture")
-    if prior is None:
-        if prior_id.startswith("openai/"):
-            from .priors import OpenAIUncondPrior
-            prior = OpenAIUncondPrior(prior_id)
-            res = prior.image_size                      # these models are fixed-size
-        else:
-            prior = DiffusionPrior(prior_id, unconditional=unconditional)
+    prior = prior or UncondPrior()
+    pool_images = list_images(pool, pool_limit) if pool else []
+    if progress and pool:
+        progress(f"pool: {len(pool_images)} images")
     classes = list(classes) if classes is not None else list(range(det.nc))
-    results: Dict[int, ClassRecovery] = {}
+    results: Dict[int, ClassResult] = {}
+
     for c in classes:
-        if progress:
-            progress(f"class {c}: searching for what makes class {c} fire ({mode} mode) ...")
-        obj = ClassObjective(det, c, margin=margin, n_aug=n_aug, seed=seed)
-        if mode == "robust":
-            from .robust import represent_robust
-            rr = represent_robust(det, prior, c, n_candidates=n_candidates, n_final=n_images, steps=steps,
-                                  strength=strength, seed=seed, progress=progress)
-            # rows: final regenerated images first, then the dominant mode's members, then other modes
-            imgs = list(rr["final_images"]) + [im for m in rr["modes"] for im in m.images[:3]]
-            scores = list(rr["final_scores"]) + [m.robust for m in rr["modes"] for _ in m.images[:3]]
-            rec = ClassRecovery(c, guided_images=imgs, guided_scores=scores, guided_trace=rr["trace"],
-                                prompt_used=f"robust: {len(rr['modes'])} modes, dominant robust={rr['modes'][0].robust:.3f}")
-            rec.clip_names = [(f"mode {i} ({len(m.members)} imgs)", m.robust) for i, m in enumerate(rr["modes"])]
-            results[c] = rec
-            sheet = class_sheet(rec, title=f"class {c}  robust score {max(rr['final_scores']):.2f}  |  " +
-                                ", ".join(f"mode{i}:{m.robust:.2f}" for i, m in enumerate(rr["modes"])), max_images=10)
-            if out_dir:
-                os.makedirs(out_dir, exist_ok=True)
-                sheet.save(os.path.join(out_dir, f"class_{c:03d}_robust.png"))
-            if show:
-                try:
-                    from IPython.display import display
-                    display(sheet)
-                except Exception:
-                    pass
-            continue
-        if mode == "embedding":
-            inv = prior.invert_embedding(obj, init_prompt=prompt, iters=iters, lr=lr, batch=batch, steps=gen_steps,
-                                         height=res, width=res, reg=reg, seed=seed,
-                                         on_iter=(lambda it, sc, _: progress(f"   iter {it:>4}  score {sc:.3f}")
-                                                  if it % 10 == 0 else None) if progress else None)
-            imgs = prior.sample_from_embedding(inv["embedding"], n=n_images, steps=max(2, gen_steps),
-                                               height=res, width=res, seed=seed + 1)
-            scores = [float(v) for v in det.class_scores(imgs)[:, c]]
-            rec = ClassRecovery(c, guided_images=imgs, guided_scores=scores, guided_trace=[inv["trace"]],
-                                prompt_used=f"inverted from '{prompt}'")
-            if hint_words:
-                from .vocab import load_vocab
-                rec.clip_names = [(w, float(v)) for w, v in prior.nearest_words(inv["embedding"], load_vocab())]
-                rec.combine()
-        else:
-            gcfg = GuidanceConfig(steps=steps, cfg=cfg, strength=strength, guide_to=guide_to, repeats=repeats,
-                                  height=res, width=res, n_images=n_images, seed=seed,
-                                  through_unet=(mode == "classifier"))
-            out = prior.guided_sample(prompt, obj, gcfg)
-            rec = ClassRecovery(c, guided_images=out["images"], guided_scores=out["scores"],
-                                guided_trace=out["trace"], prompt_used=prompt or "(unconditional)")
+        rec = ClassResult(c)
+        guide = ClassObjective(det, c, n_aug=2, seed=seed)
+        cfg = GuidanceConfig(steps=steps, strength=strength, repeats=repeats, guide_to=guide_to,
+                             smooth_k=smooth_k, seed=seed, refine_noise=refine_noise)
+        cand: List[Image.Image] = []
+        src: List[str] = []
+
+        # 1. seeds
+        seeds = []
+        if pool_images:
             if progress:
-                progress(f"   score along the trajectory: " + " ".join(f"{v:.2f}" for v in out["trace"][0][::max(1, steps // 8)]))
-        # order images by how strongly the detector fires on them
-        order = sorted(range(len(rec.guided_images)), key=lambda i: -rec.guided_scores[i])
-        rec.guided_images = [rec.guided_images[i] for i in order]
-        rec.guided_scores = [rec.guided_scores[i] for i in order]
+                progress(f"class {c}: mining seeds from the pool")
+            seeds = [s for s in mine_seeds(det, pool_images, c, top_k=n_seeds, progress=progress)
+                     if s["score"] >= min_seed_score]
+            if progress:
+                progress(f"   {len(seeds)} seeds above {min_seed_score:.2f}" +
+                         (f"; best det={seeds[0]['score']:.2f}" if seeds else ""))
+            cand += [s["image"] for s in seeds]
+            src += ["seed"] * len(seeds)
+
+        # 2. refine seeds
+        if seeds:
+            if progress:
+                progress(f"class {c}: refining {len(seeds)} seeds under guidance")
+            rcfg = GuidanceConfig(**{**cfg.__dict__, "n_images": len(seeds)})
+            out = prior.guided_refine([s["image"] for s in seeds], guide, rcfg)
+            cand += out["images"]
+            src += ["refined"] * len(out["images"])
+            rec.trace = out["trace"]
+
+        # 3. from noise
+        if len(seeds) < 2 or n_noise > 0:
+            k = max(n_noise, 4) if len(seeds) < 2 else n_noise
+            if progress:
+                progress(f"class {c}: sampling {k} images from noise under guidance")
+            ncfg = GuidanceConfig(**{**cfg.__dict__, "n_images": k})
+            out = prior.guided_sample(guide, ncfg)
+            cand += out["images"]
+            src += ["noise"] * len(out["images"])
+            rec.trace = rec.trace or out["trace"]
+
+        # 3b. optional prototype pass
+        if use_prototype and len(cand) >= 4:
+            if progress:
+                progress(f"class {c}: clustering candidate activations, re-guiding toward the dominant mode")
+            disc = discover_prototype(det, prior, c, n_candidates=len(cand), candidates=cand, seed=seed)
+            rec.modes = [(len(m.members), m.robust) for m in disc["modes"]]
+            pobj = RobustObjective(det, c, w_proto=1.0, prototype=disc["dominant"].prototype, seed=seed)
+            base = [cand[i] for i in disc["dominant"].members[:max(2, n_seeds // 2)]]
+            pcfg = GuidanceConfig(**{**cfg.__dict__, "n_images": len(base)})
+            out = prior.guided_refine(base, pobj, pcfg)
+            pobj.close()
+            cand += out["images"]
+            src += ["prototype"] * len(out["images"])
+
+        # 4. rank
+        ro = RobustObjective(det, c, seed=seed)
+        T = ro.evaluate(cand)
+        det_scores = det.class_scores(cand)[:, c].tolist()
+        order = sorted(range(len(cand)), key=lambda i: -float(T["total"][i]))
+        rec.images = [cand[i] for i in order]
+        rec.scores = [det_scores[i] for i in order]
+        rec.robust = [float(T["total"][i]) for i in order]
+        rec.source = [src[i] for i in order]
+        rec.note = f"{len(seeds)} seeds, {src.count('refined')} refined, {src.count('noise')} from noise"
         results[c] = rec
-        sheet = class_sheet(rec, title=f"class {c}  (detector fires: {max(rec.guided_scores):.2f})")
+
+        sheet = class_sheet(rec, title=f"class {c}   best: {rec.source[0]}  det={rec.scores[0]:.2f}  robust={rec.robust[0]:+.2f}")
         if out_dir:
             d = os.path.join(out_dir, f"class_{c:03d}")
             os.makedirs(d, exist_ok=True)
-            for i, im in enumerate(rec.guided_images):
-                im.save(os.path.join(d, f"rep_{i}_score{rec.guided_scores[i]:.2f}.png"))
+            for i, (im, s_) in enumerate(zip(rec.images, rec.source)):
+                im.save(os.path.join(d, f"{i:02d}_{s_}_det{rec.scores[i]:.2f}.png"))
             sheet.save(os.path.join(out_dir, f"class_{c:03d}.png"))
         if show:
             try:
@@ -149,8 +142,3 @@ def represent(weights: str, classes: Optional[Sequence[int]] = None, prior: Opti
             except Exception:
                 pass
     return results
-
-
-def represent_images(weights: str, **kw) -> Dict[int, List[Image.Image]]:
-    """Same as :func:`represent` but returns just ``{class_idx: [images...]}``."""
-    return {c: r.guided_images for c, r in represent(weights, show=False, **kw).items()}

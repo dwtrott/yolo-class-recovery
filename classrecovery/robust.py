@@ -30,7 +30,7 @@ import torch.nn.functional as F
 from PIL import Image
 
 from .detector import ClassObjective, Detector
-from .diffusion import DiffusionPrior, GuidanceConfig
+from .prior import GuidanceConfig, UncondPrior
 
 
 # --------------------------------------------------------------------- augmentations
@@ -216,8 +216,9 @@ class RobustObjective:
     @torch.no_grad()
     def evaluate(self, images: Sequence[Image.Image]) -> Dict[str, torch.Tensor]:
         from .detector import _to_tensor01
-        x = torch.stack([_to_tensor01(im) for im in images]).to(self.detector.device)
-        x = F.interpolate(x, size=(self.detector.imgsz,) * 2, mode="bilinear", align_corners=False)
+        sz = (self.detector.imgsz,) * 2
+        x = torch.stack([F.interpolate(_to_tensor01(im)[None], size=sz, mode="bilinear", align_corners=False)[0]
+                         for im in images]).to(self.detector.device)
         return {k: v.cpu() for k, v in self.terms(x).items()}
 
     def close(self):
@@ -246,29 +247,31 @@ class Mode:
     prototype: Dict[int, torch.Tensor]
 
 
-def discover_prototype(detector: Detector, prior: DiffusionPrior, class_idx: int, n_candidates: int = 24,
+def discover_prototype(detector: Detector, prior: UncondPrior, class_idx: int, n_candidates: int = 24,
                        batch: int = 4, gcfg: Optional[GuidanceConfig] = None, layers: Sequence[int] = (4, 6, 9),
-                       k: int = 3, keep_frac: float = 0.5, seed: int = 0,
+                       k: int = 3, keep_frac: float = 0.5, seed: int = 0, candidates: Optional[List[Image.Image]] = None,
                        progress: Optional[Callable[[str], None]] = None) -> Dict[str, object]:
-    """Generate candidates for ``class_idx``, score them robustly, cluster their internal
-    activations, and return the dominant mode as a pseudo-prototype.  Label-free."""
-    gcfg = gcfg or GuidanceConfig(steps=25, strength=0.1, n_images=batch, height=256, width=256, seed=seed)
+    """Score candidates for ``class_idx`` robustly, cluster their internal activations, and return
+    the dominant mode as a pseudo-prototype.  Candidates are generated from noise unless supplied
+    (e.g. mined seeds + refinements).  Label-free."""
+    gcfg = gcfg or GuidanceConfig(steps=25, strength=0.1, n_images=batch, seed=seed)
     robust = RobustObjective(detector, class_idx, seed=seed)
-    imgs: List[Image.Image] = []
+    imgs: List[Image.Image] = list(candidates) if candidates else []
     guide_obj = ClassObjective(detector, class_idx, n_aug=2, seed=seed)
-    for b in range(0, n_candidates, batch):
+    for b in range(len(imgs), n_candidates, batch):
         cfg = GuidanceConfig(**{**gcfg.__dict__, "n_images": min(batch, n_candidates - b), "seed": seed + 1000 * b})
         if progress:
             progress(f"   candidates {b + cfg.n_images}/{n_candidates}")
-        imgs += prior.guided_sample("", guide_obj, cfg)["images"]
+        imgs += prior.guided_sample(guide_obj, cfg)["images"]
     T = robust.evaluate(imgs)
     rs = T["total"]
     keep = rs.argsort(descending=True)[: max(2, int(len(imgs) * keep_frac))]
     tap = FeatureTap(detector, layers)
     with torch.no_grad():
         from .detector import _to_tensor01
-        x = torch.stack([_to_tensor01(imgs[i]) for i in keep.tolist()]).to(detector.device)
-        x = F.interpolate(x, size=(detector.imgsz,) * 2, mode="bilinear", align_corners=False)
+        sz = (detector.imgsz,) * 2
+        x = torch.stack([F.interpolate(_to_tensor01(imgs[i])[None], size=sz, mode="bilinear", align_corners=False)[0]
+                         for i in keep.tolist()]).to(detector.device)
         detector.raw(x)
         feats = tap.roi_features(T["best_box"][keep].to(detector.device))
     tap.close()
@@ -284,25 +287,3 @@ def discover_prototype(detector: Detector, prior: DiffusionPrior, class_idx: int
         modes.append(Mode(idx, float(rs[idx].mean()), [imgs[i] for i in idx], proto))
     modes.sort(key=lambda m: -m.robust)
     return {"modes": modes, "candidates": imgs, "scores": T, "dominant": modes[0]}
-
-
-def represent_robust(detector: Detector, prior: DiffusionPrior, class_idx: int, n_candidates: int = 24,
-                     n_final: int = 4, steps: int = 50, strength: float = 0.1, w_proto: float = 1.0,
-                     seed: int = 0, progress: Optional[Callable[[str], None]] = print) -> Dict[str, object]:
-    """Phase 1: discover the dominant stable mode.  Phase 2: regenerate under the full robust
-    objective pulled toward that mode's prototype.  Returns modes + final images + their terms."""
-    if progress:
-        progress(f"class {class_idx}: phase 1 — {n_candidates} candidates, robust scoring, clustering")
-    disc = discover_prototype(detector, prior, class_idx, n_candidates=n_candidates, seed=seed, progress=progress)
-    dom = disc["dominant"]
-    if progress:
-        progress(f"   {len(disc['modes'])} modes; dominant has {len(dom.members)} members, robust score {dom.robust:.3f}")
-        progress(f"class {class_idx}: phase 2 — guided regeneration toward the dominant mode")
-    obj = RobustObjective(detector, class_idx, w_proto=w_proto, prototype=dom.prototype, seed=seed)
-    cfg = GuidanceConfig(steps=steps, strength=strength, n_images=n_final, height=prior.image_size if hasattr(prior, "image_size") else 256,
-                         width=prior.image_size if hasattr(prior, "image_size") else 256, seed=seed + 7)
-    out = prior.guided_sample("", obj, cfg)
-    T = obj.evaluate(out["images"])
-    obj.close()
-    return {"modes": disc["modes"], "final_images": out["images"], "final_terms": T,
-            "final_scores": [float(v) for v in T["total"]], "trace": out["trace"]}

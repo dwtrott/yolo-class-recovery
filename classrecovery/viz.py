@@ -2,12 +2,24 @@
 
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Sequence
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Sequence, Tuple
 
 from PIL import Image, ImageDraw, ImageFont
 
-from .pipeline import ClassRecovery
-from .prompt_search import PromptSearchResult
+
+
+@dataclass
+class ClassResult:
+    """Everything recovered for one class index."""
+    class_idx: int
+    images: List[Image.Image] = field(default_factory=list)      # best first
+    scores: List[float] = field(default_factory=list)            # detector class score per image
+    robust: List[float] = field(default_factory=list)            # robust composite per image
+    source: List[str] = field(default_factory=list)              # "refined", "seed", "noise"
+    modes: List[Tuple[int, float]] = field(default_factory=list) # (n members, robust) per discovered mode
+    trace: List[List[float]] = field(default_factory=list)
+    note: str = ""
 
 
 def _font(size: int):
@@ -19,50 +31,33 @@ def _font(size: int):
     return ImageFont.load_default()
 
 
-def class_sheet(rec: ClassRecovery, search: Optional[PromptSearchResult] = None, thumb: int = 256,
-                max_images: int = 8, title: Optional[str] = None) -> Image.Image:
-    """Compose a header + a row of images for one class.
-
-    Left group: guided samples (what the detector's gradient steered the diffusion
-    model to) with their detector score.  Right group: the best prompt-search
-    images (what the model painted for the words that fired this class).
-    """
-    tiles: List[tuple] = []
-    for im, s in zip(rec.guided_images, rec.guided_scores):
-        tiles.append((im, f"guided  det={s:.2f}"))
-    if search is not None:
-        for w, im in list(search.best_images.get(rec.class_idx, {}).items())[:4]:
-            tiles.append((im, f"search '{w}'"))
-    tiles = tiles[:max_images] or [(Image.new("RGB", (thumb, thumb), (40, 40, 40)), "no images yet")]
-
+def class_sheet(rec: ClassResult, thumb: int = 256, max_images: int = 8, title: Optional[str] = None) -> Image.Image:
+    """Header + one row of images for one class (best first), each captioned with source and scores."""
+    tiles = [(im, f"{src}  det={sc:.2f}  robust={rb:+.2f}") for im, sc, rb, src in
+             zip(rec.images, rec.scores, rec.robust, rec.source)][:max_images]
+    tiles = tiles or [(Image.new("RGB", (thumb, thumb), (40, 40, 40)), "no images")]
     head_h, cap_h, pad = 64, 22, 6
     W = len(tiles) * (thumb + pad) + pad
     H = head_h + thumb + cap_h + pad * 2
     sheet = Image.new("RGB", (W, H), (24, 24, 28))
     d = ImageDraw.Draw(sheet)
     f_big, f_small = _font(20), _font(13)
-    title = title or f"class {rec.class_idx}"
-    d.text((pad, 6), title, fill=(255, 255, 255), font=f_big)
-    names = ", ".join(w for w, _ in rec.combined[:5]) or "(not named)"
-    clip = ", ".join(w for w, _ in rec.clip_names[:3])
-    srch = ", ".join(w for w, _ in rec.search_words[:3])
-    d.text((pad, 32), f"candidates: {names}", fill=(200, 230, 200), font=f_small)
-    d.text((pad, 47), f"CLIP: {clip or '-'}   |   prompt search: {srch or '-'}", fill=(170, 170, 190), font=f_small)
+    d.text((pad, 6), title or f"class {rec.class_idx}", fill=(255, 255, 255), font=f_big)
+    modes = "  ".join(f"mode{i}: {n} imgs, robust {r:+.2f}" for i, (n, r) in enumerate(rec.modes)) or rec.note
+    d.text((pad, 34), modes, fill=(200, 230, 200), font=f_small)
     x = pad
     for im, cap in tiles:
-        t = im.convert("RGB").resize((thumb, thumb))
-        sheet.paste(t, (x, head_h))
+        sheet.paste(im.convert("RGB").resize((thumb, thumb)), (x, head_h))
         d.text((x + 2, head_h + thumb + 3), cap, fill=(220, 220, 220), font=f_small)
         x += thumb + pad
     return sheet
 
 
-def contact_sheets(results: Dict[int, ClassRecovery], search: Optional[PromptSearchResult] = None,
-                   names: Optional[Dict[int, str]] = None, **kw) -> List[Image.Image]:
+def contact_sheets(results: Dict[int, ClassResult], names: Optional[Dict[int, str]] = None, **kw) -> List[Image.Image]:
     out = []
     for c in sorted(results):
         title = f"class {c}" + (f"  ({names[c]})" if names and c in names else "")
-        out.append(class_sheet(results[c], search, title=title, **kw))
+        out.append(class_sheet(results[c], title=title, **kw))
     return out
 
 

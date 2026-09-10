@@ -112,8 +112,8 @@ class Detector:
         """Max pre-NMS score per class for each image -> (n_images, nc) on CPU."""
         rows = []
         for i in range(0, len(images), batch):
-            x = torch.stack([_to_tensor01(im) for im in images[i:i + batch]])
-            x = F.interpolate(x, size=(self.imgsz, self.imgsz), mode="bilinear", align_corners=False)
+            x = torch.stack([F.interpolate(_to_tensor01(im)[None], size=(self.imgsz, self.imgsz), mode="bilinear",
+                                           align_corners=False)[0] for im in images[i:i + batch]])
             boxes, scores = self.raw(x)
             area = (boxes[..., 2] - boxes[..., 0]).clamp(min=0) * (boxes[..., 3] - boxes[..., 1]).clamp(min=0)
             ok = (area >= min_area) & (area <= max_area)

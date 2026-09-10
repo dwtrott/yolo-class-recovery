@@ -1,118 +1,87 @@
 # yolo-class-recovery
 
-Recover what each class index of an **undocumented object detector** responds to, using a
-pretrained text-to-image diffusion model as a natural-image prior instead of raw pixel-space
-activation maximisation (the "psychedelic" images).
+**Checkpoint in → clear, high-scoring images per class out.**
 
-You have `mystery.pt`, a YOLO checkpoint somebody fine-tuned, with class names missing, wrong or
-just `0..N`. The package answers "what is class 7?" with a ranked list of candidate words and a
-few clean images the detector fires on.
-
-## The one call
+You are handed an object-detection checkpoint (Ultralytics YOLO) that somebody fine-tuned on
+something, with no documentation and no class names. This package produces, for every class index,
+clear representative images the class fires on — using nothing but the detector's own activations
+and an unconditional diffusion prior. No text, no captions, no vocabulary, no labels anywhere.
 
 ```python
-from classrecovery.represent import represent
-results = represent("mystery.pt")          # {class_idx: images the detector fires on}
+from classrecovery import represent
+from classrecovery.seeds import download_pool
+
+pool = download_pool("coco-val2017")            # any folder of unlabeled photos works
+results = represent("mystery.pt", pool=pool)    # {class_idx: ClassResult}, contact sheet per class
 ```
-
-Reads the class count from the head architecture, then for each class index runs **classifier
-guidance** (Dhariwal & Nichol, 2021) with the detector as the classifier: the diffusion model runs
-*unconditionally* — no text, its only job is to know what natural images look like — and at every
-denoising step the gradient of the detector's class-k score is pushed back through the diffusion
-network into the noisy image. The detector's activations are the only thing that decides what gets
-painted. Default prior is OpenAI's unconditional 256px ImageNet diffusion model (Dhariwal & Nichol 2021 —
-the model classifier guidance was designed on; it has never seen a caption). Any Stable Diffusion
-id uses SD's no-text branch instead (weaker as a prior), and `unconditional=True` loads a text-free
-diffusers checkpoint. `mode="embedding"` (textual inversion against the
-detector) and `mode="latent"` (cheap x̂0-only nudging) are kept for comparison.
-
-## How it works
-
-| step | what | needs | cost |
-|---|---|---|---|
-| **weight diff** | compare against the public base checkpoint: which blocks moved, whether the head was re-initialised (class count changed), which class rows barely moved (probably still the original class), class-row similarity (related classes cluster), class-head bias (frequency prior — added classes are often rare) | weights of both | seconds |
-| **prompt search** | sweep ~600 concrete nouns through the diffusion model, score every class on every image, report top words per class | forward passes only (works black-box) | ~4 min / 600 words on a T4 with `sd-turbo` |
-| **guided sampling** | manifold-preserving guidance: at each denoising step decode the predicted clean image with TAESD, back-prop the target class score into it, nudge, re-noise. Box-area constraint, specificity margin, and augmentation averaging keep it from painting adversarial texture | gradients through the detector | ~1 min / class |
-| **naming** | crop each image to the detector's best box, CLIP zero-shot against the vocabulary, aggregate across images, rank-fuse with prompt-search words | CLIP | seconds |
-| **evaluate** | fine-tune a public YOLO on non-COCO classes yourself, strip the labels, measure top-k recovery | — | ~5 min training |
-
-The guidance objective for class *k* is a soft-max over anchors of
-`p_k − margin · max_{j≠k} p_j`, restricted to anchors whose box covers a sensible fraction of the
-image, averaged over random crops/flips. Gradients never go through the UNet, so a Colab T4 is enough.
-
-## Quick start (Colab)
 
 [![Open In Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/dwtrott/yolo-class-recovery/blob/main/notebooks/colab_demo.ipynb)
 
-Open `notebooks/colab_demo.ipynb`, pick a GPU runtime, run top to bottom. The last cell launches
-the GUI with a public `*.gradio.live` link.
+## How it works
 
-## Quick start (CLI)
+The class count is read from the head architecture (`4 + nc` output channels). Then, per class:
 
-```bash
-pip install -e .
-classrecovery testbed --out testbed --epochs 15              # makes testbed/mystery.pt + truth.json
-classrecovery diff    --model testbed/mystery.pt --base yolov8n.pt
-classrecovery search  --model testbed/mystery.pt --out runs/search
-classrecovery recover --model testbed/mystery.pt --search-dir runs/search --out runs/recover
-classrecovery eval    --results runs/recover --truth testbed/truth.json
-classrecovery app     --share                                # Gradio GUI
-```
+1. **Seed.** Scan an unlabeled image pool with the detector. Keep the crops the class fires on
+   *and* that pass the robustness checks. Real photos, so they are clear by construction. For a
+   class the pool covers, this alone is usually the answer.
+2. **Refine.** SDEdit: re-noise each seed to ~50 % of the diffusion schedule and denoise it under
+   detector guidance. The prior only has to sharpen an object it is already sitting on into what
+   the class most wants to see.
+3. **Noise.** If the pool yielded nothing (a class it does not cover), sample from pure noise under
+   the same guidance — classifier guidance in the original Dhariwal & Nichol sense, with the
+   detector as the classifier.
+4. **Rank.** Score every candidate with a robustness composite and show the best first, labelled by
+   where it came from (`seed` / `refined` / `noise`).
 
-## Python
+**Guidance** pushes the gradient of the class objective back *through the diffusion network* into
+the noisy image at each step, and averages that gradient over noisy copies of the decoded image
+(SmoothGrad). Texture-biased detector gradients are the root cause of "psychedelic" feature
+visualisations; smoothing is the cheapest counter-measure, a noise-robust twin of the detector is
+the thorough one (planned).
 
-```python
-from classrecovery import Detector
-from classrecovery.diffusion import DiffusionPrior, GuidanceConfig
-from classrecovery.naming import Namer
-from classrecovery.prompt_search import prompt_search
-from classrecovery.pipeline import recover_class
+**Robustness composite** (`robust.py`), all differentiable and label-free:
 
-det   = Detector("mystery.pt")
-prior = DiffusionPrior("stabilityai/sd-turbo")
-search = prompt_search(det, prior)                # gradient-free first pass
-rec = recover_class(det, prior, Namer(), class_idx=3, search=search,
-                    gcfg=GuidanceConfig(steps=8, strength=0.08, n_images=4))
-print(rec.combined[:5])                           # [('zebra', ...), ('horse', ...), ...]
-rec.guided_images[0].show()
-```
+| term | meaning |
+|---|---|
+| class | soft-max class score averaged over crop / flip / rotate / colour augmentations |
+| consistency | −Var of that score across augmentations |
+| box | spread of the best box across augmentations, mapped back to the original frame |
+| localization | the score must **collapse** when the best box is masked out — a wall-to-wall texture cannot pass this |
+| cutout | the score must **survive** small erasures inside the box |
+| prototype (optional) | cosine distance of multi-layer ROI activations to the dominant cluster of earlier candidates |
 
-## Knobs that matter
-
-* **vocabulary** — the built-in list is broad and shallow. For a domain model, pass your own
-  (`--vocab words.txt`, one term per line) and a matching template (`"an aerial photo of a {}"`).
-* **guidance strength / range** — `strength` 0.05–0.15; guide from `t/T=1.0` down to `0.2`. Guiding
-  through the last steps buys texture, not semantics, and is where adversarial patterns creep in.
-* **specificity margin** — penalises images that light up other classes too; raise it when a class
-  keeps resolving to a generic neighbour.
-* **diffusion model** — `sd-turbo` for sweeps; `stable-diffusion-v1-5` / `sd-2-1-base` with 25–50
-  steps and `cfg≈5` gives more steps to guide through when a class is stubborn.
+**Prior.** OpenAI's unconditional 256 px ImageNet diffusion model (`gd/`, vendored, MIT). It has
+never seen a caption; a gradient is the only steering it accepts.
 
 ## Layout
 
 ```
 classrecovery/
-  represent.py      the one-call interface
-  priors.py         text-free priors (OpenAI unconditional ImageNet model)
-  detector.py       differentiable YOLO wrapper + ClassObjective
-  diffusion.py      DiffusionPrior: generate(), guided_sample()
-  prompt_search.py  vocabulary sweep
-  naming.py         CLIP zero-shot naming (+ optional BLIP captions)
-  weight_diff.py    fine-tune vs base analysis
-  pipeline.py       recover_class / recover_all / evaluate
-  testbed.py        build an "undocumented fine-tune" with known answers
-  viz.py            per-class contact sheets
-  app.py            Gradio GUI
-  cli.py            command line
-  vocab.py          built-in noun list
-notebooks/colab_demo.ipynb
+  represent.py   the pipeline (seed → refine → noise → rank)
+  detector.py    differentiable YOLO wrapper + ClassObjective
+  prior.py       UncondPrior: guided_sample (from noise), guided_refine (from a seed)
+  seeds.py       unlabeled-pool mining, pool download
+  robust.py      robustness composite, feature taps, prototype discovery
+  viz.py         ClassResult + contact sheets
+  weight_diff.py compare a fine-tune against its base checkpoint (what moved, class-row matching)
+  testbed.py     make an "undocumented fine-tune" with known answers to evaluate on
+  gd/            vendored guided-diffusion UNet
 ```
+
+## Knobs
+
+* `strength` (0.05–0.2): detector vs prior. Score flat and images generic → raise; images texture-y → lower.
+* `smooth_k` (1–8): gradient smoothing; 4 is a good default, 8 if speckle persists.
+* `refine_noise` (0.3–0.7): how much of the seed to keep; lower keeps more of the photo.
+* `guide_to` (0.15–0.5): stop guiding earlier to let the prior finish cleanly.
+* `use_prototype`: cluster candidates' internal activations and re-guide toward the dominant mode.
 
 ## Caveats
 
-* Detectors are not robust classifiers; with too much guidance you get texture that scores high
-  and means nothing. Watch the guidance trace and the crops, not just the score.
-* A class the diffusion model cannot draw (a proprietary part, a rare variant) resolves to the
-  nearest thing it *can* draw. Read results as "responds to things that look like X".
-* If the class count changed in fine-tuning, the head was re-initialised and the base class order
-  is gone — the weight diff tells you when that happened.
+* A class the prior cannot draw (a proprietary part, a rare variant) resolves to the nearest clear
+  thing that fires it. Read the images as "what this class responds to".
+* The african-wildlife testbed is friendly (its classes exist in ImageNet). Evaluate on something
+  the prior cannot draw before relying on the method — the Ultralytics `signature` or
+  `medical-pills` sets are ready-made.
+* History: the exploration phase (prompt search, CLIP naming, text-embedding inversion, GUI) is
+  tagged `v0-exploration`.

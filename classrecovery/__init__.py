@@ -1,25 +1,19 @@
-"""classrecovery — recover the unknown classes of an object detector.
+"""classrecovery — checkpoint in, clear high-scoring images per class out.
 
-Given a YOLO (Ultralytics) checkpoint whose class names are missing or
-untrustworthy, this package tries to work out what each class index responds
-to, using a pretrained text-to-image diffusion model as a natural-image prior
-instead of raw pixel-space activation maximisation.
+Given an object-detection checkpoint whose classes are unknown, produce clear,
+representative images that each class index fires on, using nothing but the
+detector's own activations and an unconditional diffusion prior.
 
-Main pieces
------------
-- ``Detector``            differentiable wrapper around a YOLO checkpoint
-- ``weight_diff``         compare a fine-tuned checkpoint against its base
-- ``prompt_search``       gradient-free: generate images for a vocabulary of
-                          nouns, see which class fires
-- ``guidance``            gradient-based: steer the diffusion sampler with the
-                          detector's class score (Universal-Guidance style)
-- ``naming``              turn recovered images into ranked candidate names
-                          with CLIP zero-shot
-- ``testbed``             build an "undocumented fine-tune" to evaluate on
-- ``app``                 Gradio GUI (works in Colab with ``share=True``)
+    from classrecovery import represent
+    results = represent("mystery.pt", pool="pools/coco-val2017")
 """
 
-from .detector import Detector, ClassObjective
+from .detector import ClassObjective, Detector
+from .prior import GuidanceConfig, UncondPrior
+from .represent import represent
+from .robust import RobustObjective
+from .viz import ClassResult, class_sheet, contact_sheets, stack
 
-__all__ = ["Detector", "ClassObjective"]
-__version__ = "0.1.0"
+__all__ = ["represent", "Detector", "ClassObjective", "UncondPrior", "GuidanceConfig", "RobustObjective",
+           "ClassResult", "class_sheet", "contact_sheets", "stack"]
+__version__ = "1.0.0"
