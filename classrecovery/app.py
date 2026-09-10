@@ -198,6 +198,45 @@ def run_guided(prior_id, class_idx, prompt, domain_prefix, steps, cfg, strength,
         return "error:\n" + traceback.format_exc(), [], None, [], []
 
 
+def run_all(prior_id, domain_prefix, steps, cfg, strength, guide_from, guide_to, repeats, n_images, res, seed,
+            min_area, max_area, margin, n_aug, use_clip, only_missing, progress=None):
+    """Guided recovery for every class, then one contact sheet per class."""
+    import gradio as gr
+    progress = progress or gr.Progress()
+    if S.detector is None:
+        return "Load a detector first.", [], []
+    try:
+        prior = S.get_prior(prior_id)
+        namer = S.get_namer() if use_clip else None
+        gcfg = GuidanceConfig(steps=int(steps), cfg=float(cfg), strength=float(strength), guide_from=float(guide_from),
+                              guide_to=float(guide_to), repeats=int(repeats), height=int(res), width=int(res),
+                              n_images=int(n_images), seed=int(seed) if seed not in (None, "", -1) else None)
+        classes = [c for c in range(S.detector.nc) if not (only_missing and c in S.results)]
+        for i, c in enumerate(classes):
+            progress(i / max(1, len(classes)), desc=f"class {c} ({i + 1}/{len(classes)})")
+            S.results[c] = recover_class(S.detector, prior, namer, c, search=S.search, guided=True, gcfg=gcfg,
+                                         domain_prefix=domain_prefix, words=S.vocab,
+                                         objective_kwargs=dict(min_area=float(min_area), max_area=float(max_area),
+                                                               margin=float(margin), n_aug=int(n_aug)))
+        return sheets_gallery() + (_class_rows(),)
+    except Exception:
+        return "error:\n" + traceback.format_exc(), [], []
+
+
+def sheets_gallery():
+    """(summary text, [(sheet image, caption), ...]) for every class recovered so far."""
+    from .viz import class_sheet
+    if S.detector is None or not S.results:
+        return "No classes recovered yet — run prompt search and/or 'Recover all classes'.", []
+    items, lines = [], []
+    for c in sorted(S.results):
+        rec = S.results[c]
+        cands = ", ".join(w for w, _ in rec.combined[:5]) or "-"
+        items.append((class_sheet(rec, S.search), f"class {c}: {cands}"))
+        lines.append(f"class {c:>3}: {cands}")
+    return "\n".join(lines), items
+
+
 def run_eval(truth_file, truth_path):
     try:
         path = truth_file if isinstance(truth_file, str) else (getattr(truth_file, "name", None) or truth_path)
@@ -282,7 +321,17 @@ def build():
                 g_gallery = gr.Gallery(label="guided samples", columns=4, height=300)
                 trace = gr.Image(label="guidance trace", type="pil")
             g_crops = gr.Gallery(label="crops used for naming", columns=6, height=200)
-        with gr.Tab("4 · Overview / evaluate"):
+        with gr.Tab("4 · Class gallery"):
+            gr.Markdown("One row per class: what the diffusion model produced while being steered toward that class "
+                        "(**guided**, with the detector's score) and the best prompt-search images (**search**, with the "
+                        "word that was prompted). Uses the settings from tab 3.")
+            with gr.Row():
+                only_missing = gr.Checkbox(value=True, label="skip classes already recovered")
+                all_btn = gr.Button("Recover all classes", variant="primary")
+                refresh_btn = gr.Button("Refresh gallery")
+            all_txt = gr.Textbox(label="candidate names per class", lines=6)
+            sheets = gr.Gallery(label="per-class contact sheets", columns=1, height=700, object_fit="contain")
+        with gr.Tab("5 · Overview / evaluate"):
             table = gr.Dataframe(headers=["class", "name in ckpt", "base row match", "row drift", "head bias", "nearest classes",
                                           "prompt-search top", "recovered top"], label="per-class overview",
                                  interactive=False)
@@ -299,6 +348,10 @@ def build():
                                       guide_to, repeats, n_images, g_res, seed, min_area, max_area, margin, n_aug, use_clip],
                          [g_txt, g_gallery, trace, g_crops, table])
         eval_btn.click(run_eval, [truth_file, truth_path], [eval_txt])
+        all_btn.click(run_all, [g_prior, domain_prefix, g_steps, g_cfg, strength, guide_from, guide_to, repeats, n_images,
+                                g_res, seed, min_area, max_area, margin, n_aug, use_clip, only_missing],
+                      [all_txt, sheets, table])
+        refresh_btn.click(lambda: sheets_gallery(), [], [all_txt, sheets])
     return demo
 
 

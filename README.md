@@ -8,6 +8,23 @@ You have `mystery.pt`, a YOLO checkpoint somebody fine-tuned, with class names m
 just `0..N`. The package answers "what is class 7?" with a ranked list of candidate words and a
 few clean images the detector fires on.
 
+## The one call
+
+```python
+from classrecovery.represent import represent
+results = represent("mystery.pt")          # {class_idx: images the detector fires on}
+```
+
+Reads the class count from the head architecture, then for each class index runs **classifier
+guidance** (Dhariwal & Nichol, 2021) with the detector as the classifier: the diffusion model runs
+*unconditionally* — no text, its only job is to know what natural images look like — and at every
+denoising step the gradient of the detector's class-k score is pushed back through the diffusion
+network into the noisy image. The detector's activations are the only thing that decides what gets
+painted. Default prior is Stable Diffusion 2.1's unconditional branch (a broad natural-image prior);
+pass `unconditional=True` with a text-free diffusers checkpoint (e.g. `google/ddpm-ema-church-256`)
+for a model that has never seen a caption at all. `mode="embedding"` (textual inversion against the
+detector) and `mode="latent"` (cheap x̂0-only nudging) are kept for comparison.
+
 ## How it works
 
 | step | what | needs | cost |
@@ -74,6 +91,7 @@ rec.guided_images[0].show()
 
 ```
 classrecovery/
+  represent.py      the one-call interface
   detector.py       differentiable YOLO wrapper + ClassObjective
   diffusion.py      DiffusionPrior: generate(), guided_sample()
   prompt_search.py  vocabulary sweep
@@ -81,6 +99,7 @@ classrecovery/
   weight_diff.py    fine-tune vs base analysis
   pipeline.py       recover_class / recover_all / evaluate
   testbed.py        build an "undocumented fine-tune" with known answers
+  viz.py            per-class contact sheets
   app.py            Gradio GUI
   cli.py            command line
   vocab.py          built-in noun list
