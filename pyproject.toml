@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "classrecovery"
+version = "0.1.0"
+description = "Recover the unknown classes of an object detector using a diffusion model as an image prior."
+requires-python = ">=3.9"
+dependencies = [
+    "torch",
+    "torchvision",
+    "ultralytics>=8.1",
+    "diffusers>=0.27",
+    "transformers>=4.38",
+    "accelerate",
+    "open_clip_torch",
+    "gradio>=4.0",
+    "numpy",
+    "pillow",
+    "pyyaml",
+]
+
+[project.scripts]
+classrecovery = "classrecovery.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["classrecovery*"]
