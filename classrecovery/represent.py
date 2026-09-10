@@ -28,7 +28,7 @@ def represent(weights: str, classes: Optional[Sequence[int]] = None, prior: Opti
               n_images: int = 4, iters: int = 150, lr: float = 0.02, batch: int = 4, gen_steps: int = 1,
               reg: float = 0.05, steps: int = 50, cfg: float = 0.0, strength: float = 0.1, repeats: int = 1,
               guide_to: float = 0.15, res: int = 512, seed: int = 0, margin: float = 0.5, n_aug: int = 2,
-              hint_words: bool = False, out_dir: Optional[str] = None, show: bool = True,
+              hint_words: bool = False, n_candidates: int = 24, out_dir: Optional[str] = None, show: bool = True,
               progress: Optional[Callable[[str], None]] = print) -> Dict[int, ClassRecovery]:
     """Produce representative images for every class of ``weights``.
 
@@ -44,6 +44,14 @@ def represent(weights: str, classes: Optional[Sequence[int]] = None, prior: Opti
         into the noisy state.  The only thing that decides the content is the
         detector's activations.  ~50 steps, gradient through the UNet each
         step: a few minutes per class on an A100.
+    mode="robust": two-phase.  (1) generate ``n_candidates`` under plain
+        classifier guidance, score each with the composite robust objective
+        (class + augmentation consistency + box stability + localization +
+        cutout survival), cluster the detector's own multi-layer ROI
+        activations of the best candidates, take the dominant cluster as a
+        pseudo-prototype.  (2) regenerate under the full objective pulled
+        toward that prototype.  Finds "a stable concept that repeatedly
+        explains class k" rather than "anything that excites class k".
     mode="embedding": textual inversion against the detector — the
         text embedding fed to the diffusion model is optimised (``iters`` Adam
         steps, ``batch`` fresh noises each) until the detector fires on what it
@@ -76,6 +84,29 @@ def represent(weights: str, classes: Optional[Sequence[int]] = None, prior: Opti
         if progress:
             progress(f"class {c}: searching for what makes class {c} fire ({mode} mode) ...")
         obj = ClassObjective(det, c, margin=margin, n_aug=n_aug, seed=seed)
+        if mode == "robust":
+            from .robust import represent_robust
+            rr = represent_robust(det, prior, c, n_candidates=n_candidates, n_final=n_images, steps=steps,
+                                  strength=strength, seed=seed, progress=progress)
+            # rows: final regenerated images first, then the dominant mode's members, then other modes
+            imgs = list(rr["final_images"]) + [im for m in rr["modes"] for im in m.images[:3]]
+            scores = list(rr["final_scores"]) + [m.robust for m in rr["modes"] for _ in m.images[:3]]
+            rec = ClassRecovery(c, guided_images=imgs, guided_scores=scores, guided_trace=rr["trace"],
+                                prompt_used=f"robust: {len(rr['modes'])} modes, dominant robust={rr['modes'][0].robust:.3f}")
+            rec.clip_names = [(f"mode {i} ({len(m.members)} imgs)", m.robust) for i, m in enumerate(rr["modes"])]
+            results[c] = rec
+            sheet = class_sheet(rec, title=f"class {c}  robust score {max(rr['final_scores']):.2f}  |  " +
+                                ", ".join(f"mode{i}:{m.robust:.2f}" for i, m in enumerate(rr["modes"])), max_images=10)
+            if out_dir:
+                os.makedirs(out_dir, exist_ok=True)
+                sheet.save(os.path.join(out_dir, f"class_{c:03d}_robust.png"))
+            if show:
+                try:
+                    from IPython.display import display
+                    display(sheet)
+                except Exception:
+                    pass
+            continue
         if mode == "embedding":
             inv = prior.invert_embedding(obj, init_prompt=prompt, iters=iters, lr=lr, batch=batch, steps=gen_steps,
                                          height=res, width=res, reg=reg, seed=seed,

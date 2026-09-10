@@ -35,6 +35,15 @@ from classrecovery.testbed import build_testbed
 build_testbed("testbed", dataset="african-wildlife.yaml", base="yolov8n.pt", epochs=15, imgsz=640)
 print("wrote testbed/mystery.pt (names stripped) and testbed/truth.json (answers, for checking yourself later)")""")
 
+code("""#@title 3b. Robust mode: stable-concept search  (≈10 min/class on an A100)
+#@markdown Generates many candidates, scores them for augmentation-consistency, box stability, localization
+#@markdown (score must collapse when the box is masked) and cutout survival, clusters the detector's own
+#@markdown internal activations, and regenerates toward the dominant mode. Sheet shows the final images first,
+#@markdown then members of each discovered mode.
+from classrecovery.represent import represent
+results = represent("testbed/mystery.pt", mode="robust", n_candidates=24, steps=50, strength=0.1, n_images=4,
+                    out_dir="runs/represent")""")
+
 code("""#@title 3. Representative images for every class  (classifier guidance; a few min/class on an A100)
 #@markdown No text, no labels. The diffusion model runs unconditionally (pure natural-image prior) and at every
 #@markdown denoising step the gradient of the detector's class-k score is pushed back through the diffusion
