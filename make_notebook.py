@@ -39,8 +39,10 @@ code("""#@title 3. Representative images for every class  (classifier guidance; 
 #@markdown No text, no labels. The diffusion model runs unconditionally (pure natural-image prior) and at every
 #@markdown denoising step the gradient of the detector's class-k score is pushed back through the diffusion
 #@markdown network into the noisy image. The detector's activations are the only thing deciding the content.
+#@markdown Default prior: OpenAI's *unconditional* 256px ImageNet diffusion model (never saw a caption; ~2 GB download).
 from classrecovery.represent import represent
-results = represent("testbed/mystery.pt", steps=50, strength=0.1, n_images=4, out_dir="runs/represent")
+results = represent("testbed/mystery.pt", prior_id="openai/imagenet-256-uncond", steps=50, strength=0.1,
+                    n_images=4, out_dir="runs/represent")
 # results[c].guided_images -> PIL images for class c, strongest detector response first""")
 
 md("""Everything below is optional: naming the classes automatically, checking against the testbed's answers, and the GUI.""")

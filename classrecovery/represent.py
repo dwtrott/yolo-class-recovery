@@ -23,7 +23,7 @@ from .viz import class_sheet
 
 
 def represent(weights: str, classes: Optional[Sequence[int]] = None, prior: Optional[DiffusionPrior] = None,
-              prior_id: str = "stabilityai/stable-diffusion-2-1-base", unconditional: bool = False,
+              prior_id: str = "openai/imagenet-256-uncond", unconditional: bool = False,
               mode: str = "classifier", prompt: str = "",
               n_images: int = 4, iters: int = 150, lr: float = 0.02, batch: int = 4, gen_steps: int = 1,
               reg: float = 0.05, steps: int = 50, cfg: float = 0.0, strength: float = 0.1, repeats: int = 1,
@@ -33,10 +33,13 @@ def represent(weights: str, classes: Optional[Sequence[int]] = None, prior: Opti
     """Produce representative images for every class of ``weights``.
 
     mode="classifier" (default): classifier guidance in the original sense.
-        The diffusion model runs *unconditionally* (prompt "" = its
-        no-text branch; or a genuinely text-free model with
-        ``unconditional=True``, e.g. a diffusers ``google/ddpm-ema-*``
-        checkpoint), and at every denoising step the gradient of the
+        The diffusion model runs *unconditionally* and at every denoising
+        step the gradient of the detector's class-k score is pushed back
+        through the diffusion network into the noisy image.  Default prior
+        is OpenAI's unconditional 256px ImageNet model (``openai/...``, never
+        saw a caption); any Stable-Diffusion id uses SD's no-text branch and
+        ``unconditional=True`` loads a text-free diffusers checkpoint.
+        At every denoising step the gradient of the
         detector's class-k score is pushed back through the diffusion network
         into the noisy state.  The only thing that decides the content is the
         detector's activations.  ~50 steps, gradient through the UNet each
@@ -60,7 +63,13 @@ def represent(weights: str, classes: Optional[Sequence[int]] = None, prior: Opti
     det = Detector(weights)
     if progress:
         progress(f"loaded {weights}: {det.nc} classes read from the head architecture")
-    prior = prior or DiffusionPrior(prior_id, unconditional=unconditional)
+    if prior is None:
+        if prior_id.startswith("openai/"):
+            from .priors import OpenAIUncondPrior
+            prior = OpenAIUncondPrior(prior_id)
+            res = prior.image_size                      # these models are fixed-size
+        else:
+            prior = DiffusionPrior(prior_id, unconditional=unconditional)
     classes = list(classes) if classes is not None else list(range(det.nc))
     results: Dict[int, ClassRecovery] = {}
     for c in classes:

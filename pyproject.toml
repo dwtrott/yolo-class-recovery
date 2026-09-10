@@ -19,6 +19,7 @@ dependencies = [
     "numpy",
     "pillow",
     "pyyaml",
+    "blobfile",
 ]
 
 [project.scripts]

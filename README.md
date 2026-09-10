@@ -20,9 +20,10 @@ guidance** (Dhariwal & Nichol, 2021) with the detector as the classifier: the di
 *unconditionally* — no text, its only job is to know what natural images look like — and at every
 denoising step the gradient of the detector's class-k score is pushed back through the diffusion
 network into the noisy image. The detector's activations are the only thing that decides what gets
-painted. Default prior is Stable Diffusion 2.1's unconditional branch (a broad natural-image prior);
-pass `unconditional=True` with a text-free diffusers checkpoint (e.g. `google/ddpm-ema-church-256`)
-for a model that has never seen a caption at all. `mode="embedding"` (textual inversion against the
+painted. Default prior is OpenAI's unconditional 256px ImageNet diffusion model (Dhariwal & Nichol 2021 —
+the model classifier guidance was designed on; it has never seen a caption). Any Stable Diffusion
+id uses SD's no-text branch instead (weaker as a prior), and `unconditional=True` loads a text-free
+diffusers checkpoint. `mode="embedding"` (textual inversion against the
 detector) and `mode="latent"` (cheap x̂0-only nudging) are kept for comparison.
 
 ## How it works
@@ -92,6 +93,7 @@ rec.guided_images[0].show()
 ```
 classrecovery/
   represent.py      the one-call interface
+  priors.py         text-free priors (OpenAI unconditional ImageNet model)
   detector.py       differentiable YOLO wrapper + ClassObjective
   diffusion.py      DiffusionPrior: generate(), guided_sample()
   prompt_search.py  vocabulary sweep
