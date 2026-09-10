@@ -347,3 +347,108 @@ def degradation_scores(detector: Detector, class_idx: int, images: Sequence[Imag
     out["min"] = torch.stack([out[k] for k in DEGRADATIONS]).amin(0)
     out["mean"] = torch.stack([out[k] for k in DEGRADATIONS]).mean(0)
     return out
+
+
+# --------------------------------------------------------------------- BatchNorm-statistics term (DeepInversion)
+class BNStats:
+    """Match the detector's BatchNorm running statistics — a label-free fingerprint of its training data.
+
+    Every BatchNorm2d layer stores the mean/variance of its input on the (unknown) fine-tuning
+    set.  Penalising the distance between the batch statistics of generated images and those
+    running statistics (Yin et al., DeepInversion, 2020) pulls generations toward the fine-tuning
+    distribution using only the detector's own internals — the one prior we have for a class the
+    diffusion model has never seen.
+    """
+
+    def __init__(self, detector: Detector, layers: Optional[Sequence[int]] = None):
+        self.det = detector
+        mods = [(n, m) for n, m in detector.net.named_modules() if isinstance(m, torch.nn.BatchNorm2d)]
+        if not mods:
+            raise RuntimeError("no BatchNorm2d layers found (model fused?) — reload the checkpoint without predict()")
+        if layers is not None:
+            mods = [mods[i] for i in layers if i < len(mods)]
+        self.mods = mods
+        self._inputs: Dict[str, torch.Tensor] = {}
+        self._h = [m.register_forward_hook(self._mk(n)) for n, m in mods]
+
+    def _mk(self, name):
+        def hook(_m, inp, _out):
+            self._inputs[name] = inp[0]
+        return hook
+
+    def loss(self) -> torch.Tensor:
+        """Call after a forward pass.  Mean over layers of the normalised mean/variance mismatch."""
+        tot = 0.0
+        for n, m in self.mods:
+            x = self._inputs[n].float()
+            mu, var = x.mean((0, 2, 3)), x.var((0, 2, 3), unbiased=False)
+            rm, rv = m.running_mean.float(), m.running_var.float()
+            tot = tot + (((mu - rm) ** 2) / (rv + m.eps)).mean() + ((var - rv) ** 2 / (rv + m.eps) ** 2).mean()
+        return tot / len(self.mods)
+
+    def close(self):
+        for h in self._h:
+            h.remove()
+
+
+class BNGuidedObjective:
+    """class score  −  w_bn · BN-statistics mismatch, as one guided_sample-compatible objective."""
+
+    def __init__(self, base: ClassObjective, w_bn: float = 0.3, layers: Optional[Sequence[int]] = None):
+        self.base, self.w_bn = base, w_bn
+        self.bn = BNStats(base.detector, layers)
+
+    def score(self, img01: torch.Tensor) -> torch.Tensor:
+        s = self.base.score(img01)                     # forward pass fills the BN hooks
+        return s - self.w_bn * self.bn.loss()          # batch-level term, broadcast to every image
+
+    def loss(self, img01):
+        return -self.score(img01).sum()
+
+    def close(self):
+        self.bn.close()
+
+
+@torch.no_grad()
+def _roi_feats(detector: Detector, images: Sequence[Image.Image], class_idx: int, layers, whole: bool = False):
+    from .detector import _to_tensor01
+    obj = ClassObjective(detector, class_idx, margin=0.0, n_aug=0)
+    tap = FeatureTap(detector, layers)
+    sz = (detector.imgsz,) * 2
+    out = []
+    for b in range(0, len(images), 16):
+        x = torch.stack([F.interpolate(_to_tensor01(im)[None], size=sz, mode="bilinear", align_corners=False)[0]
+                         for im in images[b:b + 16]]).to(detector.device)
+        p_k, boxes, _ = obj.anchor_scores(x)
+        best = boxes[torch.arange(x.shape[0]), p_k.argmax(-1)]
+        if whole:
+            best = torch.tensor([[0.0, 0.0, 1.0, 1.0]], device=x.device).expand(x.shape[0], -1)
+        feats = tap.roi_features(best)
+        out.append(torch.cat([feats[l] for l in tap.layers], 1))
+    tap.close()
+    return torch.cat(out)
+
+
+@torch.no_grad()
+def agreement(detector: Detector, images: Sequence[Image.Image], class_idx: int, reference: Optional[Sequence[Image.Image]] = None,
+              layers: Sequence[int] = (4, 6, 9), top_k: int = 4) -> float:
+    """Mean pairwise cosine similarity of the top images' ROI activations, *standardised against a
+    reference set* (the image pool, or random noise images when there is none) so the common
+    component all activations share does not make everything look alike.
+
+    High = the images agree on one concept (confident); low = the prior could not settle on one
+    (bear / horse / blob) — a label-free confidence flag for the class.
+    """
+    ims = list(images)[:top_k]
+    if len(ims) < 2:
+        return float("nan")
+    if reference is None or len(reference) < 8:
+        g = torch.Generator().manual_seed(0)
+        reference = [Image.fromarray((torch.rand(64, 64, 3, generator=g) * 255).byte().numpy()).resize((256, 256))
+                     for _ in range(16)]
+    R = _roi_feats(detector, list(reference), class_idx, layers, whole=True)
+    mu, sd = R.mean(0, keepdim=True), R.std(0, keepdim=True) + 1e-6
+    Fm = F.normalize((_roi_feats(detector, ims, class_idx, layers) - mu) / sd, dim=-1)
+    S = Fm @ Fm.T
+    n = len(ims)
+    return float((S.sum() - S.diag().sum()) / (n * (n - 1)))

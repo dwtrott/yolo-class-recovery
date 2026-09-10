@@ -20,6 +20,7 @@ class ClassResult:
     source: List[str] = field(default_factory=list)              # "refined", "seed", "noise"
     modes: List[Tuple[int, float]] = field(default_factory=list) # (n members, robust) per discovered mode
     trace: List[List[float]] = field(default_factory=list)
+    agreement: float = float("nan")                              # feature agreement of top images (confidence)
     note: str = ""
 
 

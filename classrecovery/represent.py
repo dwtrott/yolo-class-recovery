@@ -30,7 +30,7 @@ from PIL import Image
 
 from .detector import ClassObjective, Detector
 from .prior import GuidanceConfig, UncondPrior
-from .robust import RobustObjective, degradation_scores, discover_prototype
+from .robust import BNGuidedObjective, RobustObjective, agreement, degradation_scores, discover_prototype
 from .seeds import list_images, mine_seeds
 from .viz import ClassResult, class_sheet
 
@@ -39,7 +39,8 @@ def represent(weights: str, pool: Optional[str] = None, classes: Optional[Sequen
               prior: Optional[UncondPrior] = None, n_seeds: int = 6, n_noise: int = 4, pool_limit: Optional[int] = None,
               steps: int = 50, strength: float = 0.03, refine_noise: float = 0.5, smooth_k: int = 8,
               repeats: int = 1, guide_frac: float = 0.5, seed: int = 0, use_prototype: bool = False,
-              min_seed_score: float = 0.15, det_imgsz: int = 320, out_dir: Optional[str] = None, show: bool = True,
+              min_seed_score: float = 0.15, det_imgsz: int = 320, bn_weight: float = 0.3,
+              out_dir: Optional[str] = None, show: bool = True,
               progress: Optional[Callable[[str], None]] = print) -> Dict[int, ClassResult]:
     """See module docstring.  Returns ``{class_idx: ClassResult}``.
 
@@ -49,6 +50,9 @@ def represent(weights: str, pool: Optional[str] = None, classes: Optional[Sequen
                     otherwise only if ``n_noise`` > 0 and you want the comparison)
     use_prototype   also cluster the candidates' internal activations and re-guide toward the
                     dominant mode (slower; helps when the candidates are mixed)
+    bn_weight       weight of the BatchNorm-statistics term (DeepInversion): pulls generations toward
+                    the detector's own training distribution — the only prior available for a class
+                    the diffusion model has never seen.  0 disables it.
     """
     det = Detector(weights, imgsz=det_imgsz)      # 320 suits the 256px prior; raise for a high-res detector
     if progress:
@@ -63,6 +67,8 @@ def represent(weights: str, pool: Optional[str] = None, classes: Optional[Sequen
     for c in classes:
         rec = ClassResult(c)
         guide = ClassObjective(det, c, n_aug=2, seed=seed)
+        if bn_weight > 0:
+            guide = BNGuidedObjective(guide, w_bn=bn_weight)
         cfg = GuidanceConfig(steps=steps, strength=strength, repeats=repeats, guide_frac=guide_frac,
                              smooth_k=smooth_k, seed=seed, refine_noise=refine_noise)
         cand: List[Image.Image] = []
@@ -131,11 +137,21 @@ def represent(weights: str, pool: Optional[str] = None, classes: Optional[Sequen
         rec.robust = [float(D["mean"][i]) for i in order]             # mean score under noise/blur/jpeg/half-res
         rec.realness = [float(real[i]) for i in order]
         rec.source = [src[i] + ("" if on_manifold[i] else "*off-manifold") for i in order]
-        rec.note = f"{len(seeds)} seeds, {src.count('refined')} refined, {src.count('noise')} from noise"
+        if hasattr(guide, "close"):
+            guide.close()
+        ref = [Image.open(p_).convert("RGB") for p_ in pool_images[:48]] if pool_images else None
+        agree = agreement(det, rec.images, c, reference=ref)
+        conf = "confident" if agree >= 0.7 else ("mixed" if agree >= 0.4 else "prior-limited")
+        rec.agreement = agree
+        rec.note = (f"{len(seeds)} seeds, {src.count('refined')} refined, {src.count('noise')} from noise   |   "
+                    f"agreement of top images {agree:.2f} -> {conf}")
         results[c] = rec
+        if progress:
+            progress(f"   class {c}: best={rec.source[0]} det={rec.scores[0]:.2f} degraded={rec.robust[0]:.2f}  "
+                     f"agreement={agree:.2f} ({conf})")
 
-        sheet = class_sheet(rec, title=f"class {c}   best: {rec.source[0]}  det={rec.scores[0]:.2f}  "
-                                       f"survives-degradation={rec.robust[0]:.2f}  recon-err={rec.realness[0]:.3f}")
+        sheet = class_sheet(rec, title=f"class {c}   {conf.upper()}   best: {rec.source[0]}  det={rec.scores[0]:.2f}  "
+                                       f"degraded={rec.robust[0]:.2f}  err={rec.realness[0]:.3f}")
         if out_dir:
             d = os.path.join(out_dir, f"class_{c:03d}")
             os.makedirs(d, exist_ok=True)

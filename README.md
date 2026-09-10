@@ -52,6 +52,15 @@ the thorough one (planned).
 | cutout | the score must **survive** small erasures inside the box |
 | prototype (optional) | cosine distance of multi-layer ROI activations to the dominant cluster of earlier candidates |
 
+**BatchNorm-statistics term** (`bn_weight`, DeepInversion-style). Every BatchNorm layer stores the
+mean/variance of its input on the fine-tuning data. Guidance also pulls generations toward those
+statistics — the detector's own fingerprint of its training distribution, and the only prior
+available for a class the diffusion model has never seen (e.g. rhino is not in ImageNet).
+
+**Confidence flag.** The top images' ROI activations are compared (standardised against the pool):
+high agreement → `CONFIDENT`; low → `PRIOR-LIMITED` (the images disagree — bear / horse / blob —
+which means the prior could not settle on the concept, not that the class is empty).
+
 **Prior.** OpenAI's unconditional 256 px ImageNet diffusion model (`gd/`, vendored, MIT). It has
 never seen a caption; a gradient is the only steering it accepts.
 
@@ -76,6 +85,7 @@ classrecovery/
 * `smooth_k` (1–8): gradient smoothing; 4 is a good default, 8 if speckle persists.
 * `refine_noise` (0.3–0.7): how much of the seed to keep; lower keeps more of the photo.
 * `guide_frac` (0.3–0.8): fraction of each run that is guided; the rest lets the prior finish cleanly.
+* `bn_weight` (0–1): BatchNorm-statistics pull toward the fine-tuning distribution; 0.3 default.
 * `use_prototype`: cluster candidates' internal activations and re-guide toward the dominant mode.
 
 ## Caveats
