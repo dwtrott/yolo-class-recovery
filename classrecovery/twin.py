@@ -66,7 +66,8 @@ def corrupt(x: torch.Tensor, max_sigma: float = 0.25) -> torch.Tensor:
 
 def train_twin(detector: Detector, pool_images: Sequence[str], steps: int = 1500, batch: int = 16, lr: float = 3e-5,
                max_sigma: float = 0.25, size: Optional[int] = None, save_path: Optional[str] = None,
-               pos_weight: float = 20.0, clean_frac: float = 0.25,
+               pos_weight: float = 20.0, clean_frac: float = 0.25, adversarial: bool = False,
+               eps: float = 4 / 255, pgd_steps: int = 3,
                progress: Optional[Callable[[str], None]] = print) -> Detector:
     """Self-distil a noise-robust copy of ``detector`` on unlabeled ``pool_images``.
 
@@ -75,8 +76,16 @@ def train_twin(detector: Detector, pool_images: Sequence[str], steps: int = 1500
     so the thousands of empty anchors do not drown the signal, plus L1 on box coordinates
     weighted by the teacher's confidence.  A ``clean_frac`` share of each batch is left
     uncorrupted so the twin keeps the teacher's clean-image behaviour.  No labels anywhere.
+
+    ``adversarial=True``: instead of random noise, each batch is perturbed by ``pgd_steps`` of
+    projected gradient ascent on the distillation loss (L-inf budget ``eps``) — the perturbation
+    that most breaks agreement with the teacher — and the twin is trained to agree anyway.
+    Adversarial training is what produces perceptually aligned gradients (Santurkar et al.
+    2019); Gaussian noise alone barely changes them.  ~3x the cost.
     """
     size = size or detector.imgsz
+    if adversarial and clean_frac < 0.5:
+        clean_frac = 0.5                                  # adversarial training erodes clean behaviour; anchor it
     teacher = detector.net
     twin = copy.deepcopy(teacher).to(detector.device).float().eval()   # eval: BN uses running stats
     trainable = []
@@ -96,17 +105,33 @@ def train_twin(detector: Detector, pool_images: Sequence[str], steps: int = 1500
             y = y.transpose(1, 2)
         return y[..., :4], y[..., 4:]                      # boxes (B,N,4) xywh px, probs (B,N,nc)
 
+    def distill_cls(sp, tp):
+        wcls = 1.0 + pos_weight * tp                        # up-weight anchors/classes the teacher believes in
+        return (wcls * F.binary_cross_entropy(sp.clamp(1e-6, 1 - 1e-6), tp, reduction="none")).sum() / wcls.sum()
+
     for it in range(steps):
         x = _load_batch(random.sample(paths, min(batch, len(paths))), size, detector.device)
         with torch.no_grad():
             tb, tp = raw(teacher, x)
-        xin = corrupt(x, max_sigma)
         n_clean = int(round(clean_frac * x.shape[0]))
+        if adversarial:
+            # PGD on the distillation loss: the perturbation that most breaks agreement with the teacher
+            delta = (torch.rand_like(x) * 2 - 1) * eps
+            alpha = 2.5 * eps / pgd_steps
+            for _ in range(pgd_steps):
+                delta.requires_grad_(True)
+                _, sp_adv = raw(twin, (x + delta).clamp(0, 1))
+                g = torch.autograd.grad(distill_cls(sp_adv, tp), delta)[0]
+                delta = (delta.detach() + alpha * g.sign()).clamp(-eps, eps)
+            xin = (x + delta.detach()).clamp(0, 1)
+            if random.random() < 0.5:                       # keep some plain-noise robustness too
+                xin = corrupt(xin, max_sigma * 0.5)
+        else:
+            xin = corrupt(x, max_sigma)
         if n_clean:
             xin = torch.cat([x[:n_clean], xin[n_clean:]])
         sb, sp = raw(twin, xin)
-        wcls = 1.0 + pos_weight * tp                        # up-weight anchors/classes the teacher believes in
-        cls_loss = (wcls * F.binary_cross_entropy(sp.clamp(1e-6, 1 - 1e-6), tp, reduction="none")).sum() / wcls.sum()
+        cls_loss = distill_cls(sp, tp)
         w = tp.amax(-1, keepdim=True)                       # only care about boxes where the teacher sees something
         box_loss = (w * (sb - tb).abs() / size).sum() / (w.sum() * 4 + 1e-6)
         loss = cls_loss + 0.5 * box_loss

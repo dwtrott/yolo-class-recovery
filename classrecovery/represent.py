@@ -167,7 +167,7 @@ def represent(weights: str, pool: Optional[str] = None, classes: Optional[Sequen
             guide.close()
         ref = [Image.open(p_).convert("RGB") for p_ in pool_images[:48]] if pool_images else None
         agree = agreement(det, rec.images, c, reference=ref)
-        conf = "confident" if agree >= 0.7 else ("mixed" if agree >= 0.4 else "prior-limited")
+        conf = "confident" if agree >= 0.6 else ("mixed" if agree >= 0.4 else "prior-limited")
         rec.agreement = agree
         rec.note = (f"{len(seeds)} seeds, {src.count('refined')} refined, {src.count('noise')} from noise   |   "
                     f"agreement of top images {agree:.2f} -> {conf}")
