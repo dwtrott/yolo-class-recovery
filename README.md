@@ -78,6 +78,7 @@ classrecovery/
   twin.py        noise-robust twin (label-free self-distillation) for guidance
   robust.py      robustness composite, feature taps, prototype discovery
   viz.py         ClassResult + contact sheets
+  evaluate.py    variants side by side, blind-judging package, scorer
   weight_diff.py compare a fine-tune against its base checkpoint (what moved, class-row matching)
   testbed.py     make an "undocumented fine-tune" with known answers to evaluate on
   gd/            vendored guided-diffusion UNet

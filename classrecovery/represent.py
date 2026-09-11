@@ -41,6 +41,7 @@ def represent(weights: str, pool: Optional[str] = None, classes: Optional[Sequen
               repeats: int = 1, guide_frac: float = 0.5, seed: int = 0, use_prototype: bool = False,
               min_seed_score: float = 0.15, det_imgsz: int = 320, bn_weight: float = 0.0,
               twin: Optional[object] = None, twin_steps: int = 0, realness_max: Optional[float] = None,
+              refine: bool = True,
               out_dir: Optional[str] = None, show: bool = True,
               progress: Optional[Callable[[str], None]] = print) -> Dict[int, ClassResult]:
     """See module docstring.  Returns ``{class_idx: ClassResult}``.
@@ -115,7 +116,7 @@ def represent(weights: str, pool: Optional[str] = None, classes: Optional[Sequen
             src += ["seed"] * len(seeds)
 
         # 2. refine seeds
-        if seeds:
+        if seeds and refine:
             if progress:
                 progress(f"class {c}: refining {len(seeds)} seeds under guidance")
             rcfg = GuidanceConfig(**{**cfg.__dict__, "n_images": len(seeds)})
