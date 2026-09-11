@@ -40,6 +40,7 @@ def represent(weights: str, pool: Optional[str] = None, classes: Optional[Sequen
               steps: int = 50, strength: float = 0.03, refine_noise: float = 0.5, smooth_k: int = 8,
               repeats: int = 1, guide_frac: float = 0.5, seed: int = 0, use_prototype: bool = False,
               min_seed_score: float = 0.15, det_imgsz: int = 320, bn_weight: float = 0.0,
+              twin: Optional[object] = None, twin_steps: int = 0, realness_max: Optional[float] = None,
               out_dir: Optional[str] = None, show: bool = True,
               progress: Optional[Callable[[str], None]] = print) -> Dict[int, ClassResult]:
     """See module docstring.  Returns ``{class_idx: ClassResult}``.
@@ -53,6 +54,12 @@ def represent(weights: str, pool: Optional[str] = None, classes: Optional[Sequen
     bn_weight       BatchNorm-statistics term (DeepInversion).  OFF by default: at 0.3-0.6 it pulls
                     images toward flat posterised colour and collapses from-noise samples; if you
                     experiment, start at 0.02.
+    twin            a noise-robust twin Detector (see ``twin.train_twin``) used for the GUIDANCE
+                    gradient only; the original detector still does all scoring.  ``twin_steps>0``
+                    trains one on the pool first (no labels; ~10 min on an A100 for 1500 steps).
+    realness_max    absolute cap on the prior's reconstruction error; above it a candidate is
+                    flagged off-manifold.  Default: 3x the median error of real pool images
+                    (or 0.03 without a pool).
     """
     det = Detector(weights, imgsz=det_imgsz)      # 320 suits the 256px prior; raise for a high-res detector
     if progress:
@@ -64,9 +71,29 @@ def represent(weights: str, pool: Optional[str] = None, classes: Optional[Sequen
     classes = list(classes) if classes is not None else list(range(det.nc))
     results: Dict[int, ClassResult] = {}
 
+    if twin is None and twin_steps > 0:
+        if not pool_images:
+            raise ValueError("twin_steps>0 needs a pool of unlabeled images to distil on")
+        from .twin import train_twin
+        if progress:
+            progress(f"training a noise-robust twin of the detector on the pool ({twin_steps} steps, no labels)")
+        twin = train_twin(det, pool_images, steps=twin_steps, progress=progress,
+                          save_path=os.path.join(out_dir, "twin.pt") if out_dir else None)
+    guide_det = twin if twin is not None else det
+
+    # realness calibration: what does the prior's reconstruction error look like on real photos?
+    if realness_max is None:
+        if pool_images:
+            ref_ims = [Image.open(p_).convert("RGB") for p_ in pool_images[:24]]
+            realness_max = 3.0 * float(prior.realness(ref_ims, seed=seed).median())
+        else:
+            realness_max = 0.03
+        if progress:
+            progress(f"realness cap: {realness_max:.3f} (reconstruction error above this = off-manifold)")
+
     for c in classes:
         rec = ClassResult(c)
-        guide = ClassObjective(det, c, n_aug=2, seed=seed)
+        guide = ClassObjective(guide_det, c, n_aug=2, seed=seed)
         if bn_weight > 0:
             guide = BNGuidedObjective(guide, w_bn=bn_weight)
         cfg = GuidanceConfig(steps=steps, strength=strength, repeats=repeats, guide_frac=guide_frac,
@@ -127,8 +154,7 @@ def represent(weights: str, pool: Optional[str] = None, classes: Optional[Sequen
         #    the prior itself cannot reconstruct, and use the raw score only as a tie-breaker.
         D = degradation_scores(det, c, cand, seed=seed)
         real = prior.realness(cand, seed=seed)
-        med = float(real.median())
-        on_manifold = [float(real[i]) <= 2.0 * med + 1e-6 for i in range(len(cand))]
+        on_manifold = [float(real[i]) <= realness_max for i in range(len(cand))]
         det_scores = D["clean"].tolist()
         key = [float(D["mean"][i]) + 0.05 * det_scores[i] - (0.0 if on_manifold[i] else 10.0) for i in range(len(cand))]
         order = sorted(range(len(cand)), key=lambda i: -key[i])

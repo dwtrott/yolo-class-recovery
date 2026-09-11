@@ -38,8 +38,11 @@ The class count is read from the head architecture (`4 + nc` output channels). T
 **Guidance** pushes the gradient of the class objective back *through the diffusion network* into
 the noisy image at each step, and averages that gradient over noisy copies of the decoded image
 (SmoothGrad). Texture-biased detector gradients are the root cause of "psychedelic" feature
-visualisations; smoothing is the cheapest counter-measure, a noise-robust twin of the detector is
-the thorough one (planned).
+visualisations; smoothing is the cheapest counter-measure. The thorough one is the **noise-robust
+twin** (`twin.py`): a copy of the detector self-distilled — no labels — to reproduce the original's
+predictions on clean pool photos while seeing noised/blurred versions. Robust models have
+perceptually aligned gradients, so the twin supplies the guidance gradient while the original
+detector still does every score. `represent(..., twin=train_twin(det, pool_images))`.
 
 **Robustness composite** (`robust.py`), all differentiable and label-free:
 
@@ -72,6 +75,7 @@ classrecovery/
   detector.py    differentiable YOLO wrapper + ClassObjective
   prior.py       UncondPrior: guided_sample (from noise), guided_refine (from a seed)
   seeds.py       unlabeled-pool mining, pool download
+  twin.py        noise-robust twin (label-free self-distillation) for guidance
   robust.py      robustness composite, feature taps, prototype discovery
   viz.py         ClassResult + contact sheets
   weight_diff.py compare a fine-tune against its base checkpoint (what moved, class-row matching)
